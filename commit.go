@@ -1,11 +1,8 @@
 package git2pg
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
-	"fmt"
-	"io"
-	"time"
 	"unicode/utf8"
 
 	"github.com/src-d/go-borges"
@@ -14,67 +11,34 @@ import (
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 )
 
-type commitNotifier func(*object.Commit) error
-
-func copyCommitNotifier(copier *tableCopier, r borges.Repository) commitNotifier {
-	return func(c *object.Commit) error {
-		hash := hash(r.ID(), c.Hash.String())
-		if copier.isCopied(hash) {
-			return nil
-		}
-
-		parentHashes := make([]string, len(c.ParentHashes))
-		for i, h := range c.ParentHashes {
-			parentHashes[i] = h.String()
-		}
-
-		parents, err := json.Marshal(parentHashes)
-		if err != nil {
-			return fmt.Errorf("cannot marshal commit parents: %s", err)
-		}
-
-		values := []interface{}{
-			r.ID(),
-			c.Hash.String(),
-			sanitizeString(c.Author.Name),
-			sanitizeString(c.Author.Email),
-			c.Author.When.Format(time.RFC3339),
-			sanitizeString(c.Committer.Name),
-			sanitizeString(c.Committer.Email),
-			c.Committer.When.Format(time.RFC3339),
-			sanitizeString(c.Message),
-			c.TreeHash.String(),
-			parents,
-		}
-
-		if err := copier.copy(hash, values...); err != nil {
-			return fmt.Errorf("cannot copy commit %s: %s", c.Hash, err)
-		}
-
-		return nil
-	}
-}
-
-type indexedCommitIter struct {
-	repo     borges.Repository
-	stack    []*stackFrame
-	seen     map[plumbing.Hash]struct{}
-	notifier commitNotifier
-}
-
-func newIndexedCommitIter(
+func visitRefCommits(
+	ctx context.Context,
 	repo borges.Repository,
+	ref *plumbing.Reference,
 	start *object.Commit,
-	commitNotifier commitNotifier,
-) *indexedCommitIter {
-	return &indexedCommitIter{
-		repo: repo,
-		stack: []*stackFrame{
-			{0, 0, []plumbing.Hash{start.Hash}},
-		},
-		seen:     make(map[plumbing.Hash]struct{}),
-		notifier: commitNotifier,
-	}
+	onCommitSeen func(*object.Commit) error,
+	onRefCommitSeen func(*plumbing.Reference, plumbing.Hash, int) error,
+	graphCache map[plumbing.Hash][]plumbing.Hash,
+) error {
+	return refCommitsVisitor{
+		ctx,
+		repo,
+		ref,
+		onCommitSeen,
+		onRefCommitSeen,
+		graphCache,
+		make(map[plumbing.Hash]struct{}),
+	}.visitCommits(start)
+}
+
+type refCommitsVisitor struct {
+	ctx             context.Context
+	repo            borges.Repository
+	ref             *plumbing.Reference
+	onCommitSeen    func(*object.Commit) error
+	onRefCommitSeen func(*plumbing.Reference, plumbing.Hash, int) error
+	graphCache      map[plumbing.Hash][]plumbing.Hash
+	seen            map[plumbing.Hash]struct{}
 }
 
 type stackFrame struct {
@@ -83,47 +47,109 @@ type stackFrame struct {
 	hashes []plumbing.Hash
 }
 
-func (i *indexedCommitIter) next() (*object.Commit, int, error) {
+func (r refCommitsVisitor) visitCommits(start *object.Commit) error {
+	stack := []*stackFrame{
+		{0, 0, []plumbing.Hash{start.Hash}},
+	}
 	for {
-		if len(i.stack) == 0 {
-			return nil, -1, io.EOF
+		if len(stack) == 0 {
+			return nil
 		}
 
-		frame := i.stack[len(i.stack)-1]
+		select {
+		case <-r.ctx.Done():
+			return context.Canceled
+		default:
+		}
 
+		frame := stack[len(stack)-1]
 		h := frame.hashes[frame.pos]
-		if _, ok := i.seen[h]; !ok {
-			i.seen[h] = struct{}{}
-		}
-
 		frame.pos++
 		if frame.pos >= len(frame.hashes) {
-			i.stack = i.stack[:len(i.stack)-1]
+			stack = stack[:len(stack)-1]
 		}
 
-		c, err := i.repo.R().CommitObject(h)
+		if node, ok := r.graphCache[h]; ok {
+			if err := r.visitCachedNode(frame.idx, h, node); err != nil {
+				return err
+			}
+			continue
+		}
+
+		c, err := r.repo.R().CommitObject(h)
 		if err != nil {
-			return nil, -1, err
+			return err
 		}
 
-		if err := i.notifier(c); err != nil {
-			return nil, -1, err
+		if err := r.onCommitSeen(c); err != nil {
+			return err
 		}
+
+		r.seen[c.Hash] = struct{}{}
+		r.graphCache[c.Hash] = c.ParentHashes
 
 		if c.NumParents() > 0 {
 			parents := make([]plumbing.Hash, 0, c.NumParents())
 			for _, h = range c.ParentHashes {
-				if _, ok := i.seen[h]; !ok {
+				if _, ok := r.seen[h]; !ok {
 					parents = append(parents, h)
 				}
 			}
 
 			if len(parents) > 0 {
-				i.stack = append(i.stack, &stackFrame{frame.idx + 1, 0, parents})
+				stack = append(stack, &stackFrame{frame.idx + 1, 0, parents})
 			}
 		}
 
-		return c, frame.idx, nil
+		if err := r.onRefCommitSeen(r.ref, c.Hash, frame.idx); err != nil {
+			return err
+		}
+	}
+}
+
+func (r refCommitsVisitor) visitCachedNode(
+	idx int,
+	h plumbing.Hash,
+	parents []plumbing.Hash,
+) error {
+	stack := []*stackFrame{
+		{0, 0, []plumbing.Hash{h}},
+	}
+
+	for {
+		if len(stack) == 0 {
+			return nil
+		}
+
+		select {
+		case <-r.ctx.Done():
+			return context.Canceled
+		default:
+		}
+
+		frame := stack[len(stack)-1]
+		h := frame.hashes[frame.pos]
+		frame.pos++
+		if frame.pos >= len(frame.hashes) {
+			stack = stack[:len(stack)-1]
+		}
+
+		r.seen[h] = struct{}{}
+
+		var parents []plumbing.Hash
+		for _, h = range r.graphCache[h] {
+			if _, ok := r.seen[h]; !ok {
+				parents = append(parents, h)
+			}
+		}
+
+		if len(parents) > 0 {
+			stack = append(stack, &stackFrame{frame.idx + 1, 0, parents})
+		}
+
+		if err := r.onRefCommitSeen(r.ref, h, frame.idx); err != nil {
+			return err
+		}
 	}
 }
 

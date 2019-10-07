@@ -3,6 +3,7 @@ package git2pg
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,7 +16,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
-	"gopkg.in/src-d/go-git.v4/plumbing/storer"
 )
 
 // TODO(erizocosmico): association between root trees and tree entries and
@@ -33,6 +33,8 @@ type migrator struct {
 	treeBlobs    *tableCopier
 	files        *tableCopier
 	blobs        *tableCopier
+
+	trees map[plumbing.Hash]struct{}
 }
 
 var tables = []string{
@@ -72,6 +74,7 @@ func Migrate(
 		treeBlobs:    copiers["tree_blobs"],
 		files:        copiers["tree_files"],
 		blobs:        copiers["blobs"],
+		trees:        make(map[plumbing.Hash]struct{}),
 	}
 
 	iter, err := lib.Repositories(borges.ReadOnlyMode)
@@ -100,12 +103,16 @@ func Migrate(
 		g.Go(func() error {
 			start := time.Now()
 			defer func() {
-				log.WithField("elapsed", time.Since(start)).
-					Info("migrated repository")
 				<-tokens
 			}()
+
 			log.Debug("migrating repository")
-			return m.migrateRepository(ctx, repo)
+			if err := m.migrateRepository(ctx, repo); err != nil {
+				return err
+			}
+			log.WithField("elapsed", time.Since(start)).Info("migrated repository")
+
+			return nil
 		})
 	}
 
@@ -130,19 +137,24 @@ func (m *migrator) migrateRepository(
 	ctx context.Context,
 	r borges.Repository,
 ) error {
-	if err := m.repositories.copy(hash(r.ID()), r.ID()); err != nil {
+	if err := m.repositories.copy(r.ID()); err != nil {
 		return fmt.Errorf("unable to copy repository: %s", err)
+	}
+
+	var trees []plumbing.Hash
+	onCommitSeen := func(c *object.Commit) {
+		trees = append(trees, c.TreeHash)
 	}
 
 	log := logrus.WithField("repo", r.ID())
 	start := time.Now()
-	if err := m.migrateRefs(ctx, r); err != nil {
+	if err := m.migrateRefs(ctx, r, onCommitSeen); err != nil {
 		return fmt.Errorf("cannot migrate refs: %s", err)
 	}
 	log.WithField("elapsed", time.Since(start)).Debug("migrated references and commits")
 
 	start = time.Now()
-	if err := m.migrateFiles(ctx, r); err != nil {
+	if err := m.migrateFiles(ctx, r, dedupHashes(trees)); err != nil {
 		return fmt.Errorf("cannot migrate files: %s", err)
 	}
 	log.WithField("elapsed", time.Since(start)).Debug("migrated trees and files")
@@ -150,144 +162,138 @@ func (m *migrator) migrateRepository(
 	return r.Close()
 }
 
-func (m *migrator) migrateRefs(ctx context.Context, repo borges.Repository) error {
-	var (
-		refs    storer.ReferenceIter
-		head    *plumbing.Reference
-		commits *indexedCommitIter
-		ref     *plumbing.Reference
-		err     error
-	)
+func (m *migrator) migrateRefs(
+	ctx context.Context,
+	repo borges.Repository,
+	commitSeen func(*object.Commit),
+) error {
+	graphCache := make(map[plumbing.Hash][]plumbing.Hash)
 
-	notifier := copyCommitNotifier(m.commits, repo)
+	onCommitSeen := func(c *object.Commit) error {
+		if _, ok := graphCache[c.Hash]; ok {
+			return nil
+		}
 
-	// TODO(erizocosmico): refactor this as a visitor and move it to its file
-	// just like we do with files.
+		commitSeen(c)
+
+		parentHashes := make([]string, len(c.ParentHashes))
+		for i, h := range c.ParentHashes {
+			parentHashes[i] = h.String()
+		}
+
+		parents, err := json.Marshal(parentHashes)
+		if err != nil {
+			return fmt.Errorf("cannot marshal commit parents: %s", err)
+		}
+
+		values := []interface{}{
+			repo.ID(),
+			c.Hash.String(),
+			sanitizeString(c.Author.Name),
+			sanitizeString(c.Author.Email),
+			c.Author.When.Format(time.RFC3339),
+			sanitizeString(c.Committer.Name),
+			sanitizeString(c.Committer.Email),
+			c.Committer.When.Format(time.RFC3339),
+			sanitizeString(c.Message),
+			c.TreeHash.String(),
+			parents,
+		}
+
+		if err := m.commits.copy(values...); err != nil {
+			return fmt.Errorf("cannot copy commit %s: %s", c.Hash, err)
+		}
+
+		return nil
+	}
+
+	onRefCommitSeen := func(ref *plumbing.Reference, commit plumbing.Hash, idx int) error {
+		return m.refCommits.copy(
+			repo.ID(),
+			commit.String(),
+			ref.Name().String(),
+			uint64(idx),
+		)
+	}
+
+	head, err := repo.R().Head()
+	if err != nil && err != plumbing.ErrReferenceNotFound {
+		return fmt.Errorf("cannot get HEAD reference: %s", err)
+	}
+
+	refs, err := repo.R().References()
+	if err != nil {
+		return fmt.Errorf("cannot get references: %s", err)
+	}
+	defer refs.Close()
+
 	for {
-		if refs == nil {
-			refs, err = repo.R().References()
-			if err != nil {
-				return fmt.Errorf("cannot get references: %s", err)
-			}
-
-			head, err = repo.R().Head()
-			if err != nil && err != plumbing.ErrReferenceNotFound {
-				return fmt.Errorf("cannot get HEAD reference: %s", err)
-			}
-		}
-
-		if commits == nil {
-			var r *plumbing.Reference
-			if head == nil {
-				r, err = refs.Next()
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-
-					return fmt.Errorf("cannot get next reference: %s", err)
-				}
-			} else {
-				r = plumbing.NewHashReference(plumbing.ReferenceName("HEAD"), head.Hash())
-				head = nil
-			}
-
-			ref = r
-			if isIgnoredReference(ref) {
-				continue
-			}
-
-			commit, err := resolveCommit(repo.R(), ref.Hash())
-			if err != nil {
-				if err == errInvalidCommit {
-					continue
-				}
-
-				return fmt.Errorf("cannot resolve commit: %s", err)
-			}
-
-			err = m.refs.copy(
-				hash(repo.ID(), ref.Name().String()),
-				repo.ID(),
-				ref.Name().String(),
-				commit.Hash.String(),
-			)
-			if err != nil {
-				return fmt.Errorf("cannot copy reference: %s", err)
-			}
-
-			if err := notifier(commit); err != nil {
-				return err
-			}
-
-			commits = newIndexedCommitIter(repo, commit, notifier)
-		}
-
 		select {
 		case <-ctx.Done():
 			return context.Canceled
 		default:
 		}
 
-		commit, idx, err := commits.next()
+		var ref *plumbing.Reference
+		if head == nil {
+			ref, err = refs.Next()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+
+				return fmt.Errorf("cannot get next reference: %s", err)
+			}
+
+			if isIgnoredReference(ref) {
+				continue
+			}
+		} else {
+			ref = head
+			head = nil
+		}
+
+		commit, err := resolveCommit(repo.R(), ref.Hash())
 		if err != nil {
-			if err == io.EOF {
-				commits = nil
+			if err == errInvalidCommit {
 				continue
 			}
 
-			return fmt.Errorf("cannot get next commit: %s", err)
+			return fmt.Errorf("cannot resolve commit: %s", err)
 		}
 
-		hash := hash(repo.ID(), ref.Name().String(), idx)
-		values := []interface{}{
+		err = m.refs.copy(
 			repo.ID(),
-			commit.Hash.String(),
 			ref.Name().String(),
-			int64(idx),
+			commit.Hash.String(),
+		)
+		if err != nil {
+			return err
 		}
 
-		if err := m.refCommits.copy(hash, values...); err != nil {
-			return fmt.Errorf("cannot copy ref commit: %s", err)
+		err = visitRefCommits(
+			ctx,
+			repo,
+			ref,
+			commit,
+			onCommitSeen,
+			onRefCommitSeen,
+			graphCache,
+		)
+		if err != nil {
+			return err
 		}
-	}
-
-	if refs != nil {
-		refs.Close()
 	}
 
 	return nil
 }
 
-func (m *migrator) migrateFiles(ctx context.Context, r borges.Repository) error {
-	commits, err := r.R().CommitObjects()
-	if err != nil {
-		return fmt.Errorf("error getting commits: %s", err)
-	}
-
-	rootTrees := make(map[plumbing.Hash]struct{})
-	for {
-		select {
-		case <-ctx.Done():
-			return context.Canceled
-		default:
-		}
-
-		commit, err := commits.Next()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-
-			return fmt.Errorf("error getting next commit: %s", err)
-		}
-
-		rootTrees[commit.TreeHash] = struct{}{}
-	}
-
+func (m *migrator) migrateFiles(
+	ctx context.Context,
+	r borges.Repository,
+	trees []plumbing.Hash,
+) error {
 	onTreeEntrySeen := func(tree plumbing.Hash, entry object.TreeEntry) error {
-		hash := hash(r.ID(), tree, entry.Name)
-
 		values := []interface{}{
 			r.ID(),
 			entry.Name,
@@ -295,28 +301,26 @@ func (m *migrator) migrateFiles(ctx context.Context, r borges.Repository) error 
 			tree.String(),
 			strconv.FormatInt(int64(entry.Mode), 8),
 		}
-		if err := m.treeEntries.copy(hash, values...); err != nil {
+		if err := m.treeEntries.copy(values...); err != nil {
 			return fmt.Errorf("cannot copy tree entry: %s", err)
 		}
 
 		return nil
 	}
 	onTreeBlobSeen := func(tree, blob plumbing.Hash) error {
-		hash := hash(r.ID(), tree, blob)
 		values := []interface{}{
 			r.ID(),
 			tree.String(),
 			blob.String(),
 		}
 
-		if err := m.treeBlobs.copy(hash, values...); err != nil {
+		if err := m.treeBlobs.copy(values...); err != nil {
 			return fmt.Errorf("cannot copy tree blob: %s", err)
 		}
 
 		return nil
 	}
 	onFileSeen := func(path string, tree, blob plumbing.Hash) error {
-		hash := hash(r.ID(), tree, blob)
 		values := []interface{}{
 			r.ID(),
 			tree.String(),
@@ -325,15 +329,13 @@ func (m *migrator) migrateFiles(ctx context.Context, r borges.Repository) error 
 			enry.IsVendor(path),
 		}
 
-		if err := m.files.copy(hash, values...); err != nil {
+		if err := m.files.copy(values...); err != nil {
 			return fmt.Errorf("cannot copy file: %s", err)
 		}
 
 		return nil
 	}
 	onBlobSeen := func(blob *object.Blob) error {
-		hash := hash(r.ID(), blob.Hash)
-
 		rd, err := blob.Reader()
 		if err != nil {
 			return fmt.Errorf("cannot get blob reader: %s", err)
@@ -352,7 +354,7 @@ func (m *migrator) migrateFiles(ctx context.Context, r borges.Repository) error 
 			isBinary(content),
 		}
 
-		if err := m.blobs.copy(hash, values...); err != nil {
+		if err := m.blobs.copy(values...); err != nil {
 			return fmt.Errorf("cannot copy tree blob: %s", err)
 		}
 
@@ -361,12 +363,8 @@ func (m *migrator) migrateFiles(ctx context.Context, r borges.Repository) error 
 
 	seenBlobs := make(map[plumbing.Hash]struct{})
 	treeCache := make(map[plumbing.Hash]*treeNode)
-	for tree := range rootTrees {
+	for _, tree := range trees {
 		start := time.Now()
-		logrus.WithFields(logrus.Fields{
-			"repo": r.ID(),
-			"tree": tree.String(),
-		}).Debug("migrating tree")
 		err := visitFileTree(
 			ctx,
 			r,
@@ -390,4 +388,17 @@ func (m *migrator) migrateFiles(ctx context.Context, r borges.Repository) error 
 	}
 
 	return nil
+}
+
+func dedupHashes(hashes []plumbing.Hash) []plumbing.Hash {
+	var result []plumbing.Hash
+	var seen = make(map[plumbing.Hash]struct{})
+	for _, h := range hashes {
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		result = append(result, h)
+	}
+	return result
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"hash/crc64"
 	"sync"
 )
 
@@ -14,9 +13,6 @@ type tableCopier struct {
 
 	mut  sync.Mutex
 	stmt *sql.Stmt
-
-	cacheMut sync.RWMutex
-	cache    map[uint64]struct{}
 }
 
 func newTableCopier(
@@ -35,26 +31,13 @@ func newTableCopier(
 	}
 
 	return &tableCopier{
-		ctx:   ctx,
-		tx:    tx,
-		stmt:  stmt,
-		cache: make(map[uint64]struct{}),
+		ctx:  ctx,
+		tx:   tx,
+		stmt: stmt,
 	}, nil
 }
 
-func (c *tableCopier) isCopied(hash uint64) bool {
-	c.cacheMut.RLock()
-	_, ok := c.cache[hash]
-	c.cacheMut.RUnlock()
-	return ok
-}
-
-// TODO(erizocosmico): remove hash and leave the uniqueness to the migrators
-// themselves.
-func (c *tableCopier) copy(hash uint64, values ...interface{}) error {
-	if c.isCopied(hash) {
-		return nil
-	}
+func (c *tableCopier) copy(values ...interface{}) error {
 
 	c.mut.Lock()
 	defer c.mut.Unlock()
@@ -62,9 +45,6 @@ func (c *tableCopier) copy(hash uint64, values ...interface{}) error {
 		return fmt.Errorf("cannot exec in copy operation: %s", err)
 	}
 
-	c.cacheMut.Lock()
-	c.cache[hash] = struct{}{}
-	c.cacheMut.Unlock()
 	return nil
 }
 
@@ -84,10 +64,4 @@ func (c *tableCopier) Close() error {
 	}
 
 	return nil
-}
-
-var table = crc64.MakeTable(crc64.ISO)
-
-func hash(elems ...interface{}) uint64 {
-	return crc64.Checksum([]byte(fmt.Sprintf("%#v", elems)), table)
 }
