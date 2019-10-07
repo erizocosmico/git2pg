@@ -48,6 +48,7 @@ var tables = []string{
 	"blobs",
 }
 
+// Migrate the given git repositories library to the given database.
 func Migrate(
 	ctx context.Context,
 	lib borges.Library,
