@@ -22,13 +22,14 @@ import (
 func main() {
 	var path string
 	var useSiva, rooted, verbose bool
-	var buckets, workers int
+	var buckets, workers, repoWorkers int
 
 	flag.StringVar(&path, "d", "", "path to the repositories library")
 	flag.BoolVar(&useSiva, "siva", false, "use siva repositories")
 	flag.BoolVar(&rooted, "rooted", false, "use rooted repositories")
 	flag.IntVar(&buckets, "buckets", 0, "number of characters of buckets in the repository library")
-	flag.IntVar(&workers, "workers", runtime.NumCPU(), "workers to use")
+	flag.IntVar(&workers, "workers", runtime.NumCPU()/2, "workers to use")
+	flag.IntVar(&repoWorkers, "repo-workers", runtime.NumCPU()/2, "workers to use for processing each repository")
 	flag.BoolVar(&verbose, "v", false, "verbose mode")
 	flag.Parse()
 
@@ -94,7 +95,7 @@ func main() {
 		cancel()
 	}()
 
-	if err := git2pg.Migrate(ctx, lib, db, workers); err != nil {
+	if err := git2pg.Migrate(ctx, lib, db, workers, repoWorkers); err != nil {
 		logrus.Fatalf("unable to migrate library to database: %s", err)
 	}
 

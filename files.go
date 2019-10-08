@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
-	"github.com/src-d/go-borges"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/filemode"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
@@ -16,14 +16,13 @@ import (
 
 func visitFileTree(
 	ctx context.Context,
-	repo borges.Repository,
+	repo *syncRepository,
 	origin plumbing.Hash,
 	onTreeEntrySeen func(plumbing.Hash, object.TreeEntry) error,
 	onTreeBlobSeen func(tree, blob plumbing.Hash) error,
 	onFileSeen func(path string, tree plumbing.Hash, blob plumbing.Hash) error,
-	onBlobSeen func(*object.Blob) error,
-	seenBlobs map[plumbing.Hash]struct{},
-	treeCache map[plumbing.Hash]*treeNode,
+	onBlobSeen func(*object.Blob, []byte) error,
+	treesCache *treesCache,
 ) error {
 	return fileTreeVisitor{
 		repo,
@@ -32,20 +31,18 @@ func visitFileTree(
 		onTreeBlobSeen,
 		onFileSeen,
 		onBlobSeen,
-		seenBlobs,
-		treeCache,
+		treesCache,
 	}.visitTree(ctx, origin, "")
 }
 
 type fileTreeVisitor struct {
-	repo            borges.Repository
+	repo            *syncRepository
 	origin          plumbing.Hash
 	onTreeEntrySeen func(plumbing.Hash, object.TreeEntry) error
 	onTreeBlobSeen  func(tree, blob plumbing.Hash) error
 	onFileSeen      func(path string, tree plumbing.Hash, blob plumbing.Hash) error
-	onBlobSeen      func(*object.Blob) error
-	seenBlobs       map[plumbing.Hash]struct{}
-	treeCache       map[plumbing.Hash]*treeNode
+	onBlobSeen      func(*object.Blob, []byte) error
+	cache           *treesCache
 }
 
 func (f fileTreeVisitor) visitTree(
@@ -59,11 +56,11 @@ func (f fileTreeVisitor) visitTree(
 	default:
 	}
 
-	if tree, ok := f.treeCache[hash]; ok {
+	if tree, ok := f.cache.tree(hash); ok {
 		return f.visitCachedTree(ctx, path, tree)
 	}
 
-	t, err := f.repo.R().TreeObject(hash)
+	t, err := f.repo.tree(hash)
 	if err != nil {
 		return fmt.Errorf("cannot get tree: %s", err)
 	}
@@ -79,7 +76,7 @@ func (f fileTreeVisitor) visitTree(
 		}
 	}
 
-	f.treeCache[hash] = node
+	f.cache.putTree(hash, node)
 
 	return nil
 }
@@ -130,7 +127,9 @@ func (f fileTreeVisitor) visitEntry(
 		if err := f.visitTree(ctx, entry.Hash, path); err != nil {
 			return err
 		}
-		node.entries = append(node.entries, f.treeCache[entry.Hash])
+
+		tree, _ := f.cache.tree(entry.Hash)
+		node.entries = append(node.entries, tree)
 	} else {
 		if err := f.visitFile(entry.Hash, path); err != nil {
 			return err
@@ -154,17 +153,21 @@ func (f fileTreeVisitor) visitFile(hash plumbing.Hash, path string) error {
 		return err
 	}
 
-	_, ok := f.seenBlobs[hash]
-	if ok {
+	if f.cache.blobSeen(hash) {
 		return nil
 	}
 
-	blob, err := f.repo.R().BlobObject(hash)
+	blob, err := f.repo.blob(hash)
 	if err != nil {
 		return fmt.Errorf("could not get blob: %s", err)
 	}
 
-	return f.onBlobSeen(blob)
+	content, err := f.repo.blobContent(blob)
+	if err != nil {
+		return err
+	}
+
+	return f.onBlobSeen(blob, content)
 }
 
 const sniffLen = 8000
@@ -215,4 +218,42 @@ func join(parts ...string) string {
 		}
 	}
 	return strings.Join(p, "/")
+}
+
+type treesCache struct {
+	blobsMut  sync.RWMutex
+	seenBlobs map[plumbing.Hash]struct{}
+
+	treesMut sync.RWMutex
+	trees    map[plumbing.Hash]*treeNode
+}
+
+func newTreesCache() *treesCache {
+	return &treesCache{
+		seenBlobs: make(map[plumbing.Hash]struct{}),
+		trees:     make(map[plumbing.Hash]*treeNode),
+	}
+}
+
+func (c *treesCache) putTree(hash plumbing.Hash, node *treeNode) {
+	c.treesMut.Lock()
+	c.trees[hash] = node
+	c.treesMut.Unlock()
+}
+
+func (c *treesCache) tree(hash plumbing.Hash) (*treeNode, bool) {
+	c.treesMut.RLock()
+	node, ok := c.trees[hash]
+	c.treesMut.RUnlock()
+	return node, ok
+}
+
+func (c *treesCache) blobSeen(hash plumbing.Hash) (seenBefore bool) {
+	c.treesMut.Lock()
+	_, ok := c.seenBlobs[hash]
+	if !ok {
+		c.seenBlobs[hash] = struct{}{}
+	}
+	c.treesMut.Unlock()
+	return ok
 }

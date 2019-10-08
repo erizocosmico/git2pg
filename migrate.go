@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strconv"
 	"time"
 
@@ -22,8 +21,9 @@ import (
 // remotes.
 
 type migrator struct {
-	lib borges.Library
-	db  *sql.DB
+	lib         borges.Library
+	db          *sql.DB
+	repoWorkers int
 
 	repositories *tableCopier
 	refs         *tableCopier
@@ -33,8 +33,6 @@ type migrator struct {
 	treeBlobs    *tableCopier
 	files        *tableCopier
 	blobs        *tableCopier
-
-	trees map[plumbing.Hash]struct{}
 }
 
 var tables = []string{
@@ -53,7 +51,7 @@ func Migrate(
 	ctx context.Context,
 	lib borges.Library,
 	db *sql.DB,
-	workers int,
+	workers, repoWorkers int,
 ) error {
 	var copiers = make(map[string]*tableCopier)
 	for _, t := range tables {
@@ -75,7 +73,7 @@ func Migrate(
 		treeBlobs:    copiers["tree_blobs"],
 		files:        copiers["tree_files"],
 		blobs:        copiers["blobs"],
-		trees:        make(map[plumbing.Hash]struct{}),
+		repoWorkers:  repoWorkers,
 	}
 
 	iter, err := lib.Repositories(borges.ReadOnlyMode)
@@ -308,6 +306,7 @@ func (m *migrator) migrateFiles(
 
 		return nil
 	}
+
 	onTreeBlobSeen := func(tree, blob plumbing.Hash) error {
 		values := []interface{}{
 			r.ID(),
@@ -321,6 +320,7 @@ func (m *migrator) migrateFiles(
 
 		return nil
 	}
+
 	onFileSeen := func(path string, tree, blob plumbing.Hash) error {
 		values := []interface{}{
 			r.ID(),
@@ -336,17 +336,8 @@ func (m *migrator) migrateFiles(
 
 		return nil
 	}
-	onBlobSeen := func(blob *object.Blob) error {
-		rd, err := blob.Reader()
-		if err != nil {
-			return fmt.Errorf("cannot get blob reader: %s", err)
-		}
 
-		content, err := ioutil.ReadAll(rd)
-		if err != nil {
-			return fmt.Errorf("cannot read blob content: %s", err)
-		}
-
+	onBlobSeen := func(blob *object.Blob, content []byte) error {
 		values := []interface{}{
 			r.ID(),
 			blob.Hash.String(),
@@ -362,33 +353,38 @@ func (m *migrator) migrateFiles(
 		return nil
 	}
 
-	seenBlobs := make(map[plumbing.Hash]struct{})
-	treeCache := make(map[plumbing.Hash]*treeNode)
-	for _, tree := range trees {
-		start := time.Now()
-		err := visitFileTree(
-			ctx,
-			r,
-			tree,
-			onTreeEntrySeen,
-			onTreeBlobSeen,
-			onFileSeen,
-			onBlobSeen,
-			seenBlobs,
-			treeCache,
-		)
-		if err != nil {
-			return err
-		}
+	treesCache := newTreesCache()
+	tokens := make(chan struct{}, m.repoWorkers)
+	repo := &syncRepository{Repository: r}
+	var g errgroup.Group
 
-		logrus.WithFields(logrus.Fields{
-			"elapsed": time.Since(start),
-			"tree":    tree.String(),
-			"repo":    r.ID(),
-		}).Debug("migrated tree")
+	for _, tree := range trees {
+		tokens <- struct{}{}
+		g.Go(func() error {
+			start := time.Now()
+			defer func() {
+				logrus.WithFields(logrus.Fields{
+					"elapsed": time.Since(start),
+					"tree":    tree.String(),
+					"repo":    r.ID(),
+				}).Debug("migrated tree")
+				<-tokens
+			}()
+
+			return visitFileTree(
+				ctx,
+				repo,
+				tree,
+				onTreeEntrySeen,
+				onTreeBlobSeen,
+				onFileSeen,
+				onBlobSeen,
+				treesCache,
+			)
+		})
 	}
 
-	return nil
+	return g.Wait()
 }
 
 func dedupHashes(hashes []plumbing.Hash) []plumbing.Hash {
