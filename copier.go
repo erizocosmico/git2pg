@@ -38,7 +38,6 @@ func newTableCopier(
 }
 
 func (c *tableCopier) copy(values ...interface{}) error {
-
 	c.mut.Lock()
 	defer c.mut.Unlock()
 	if _, err := c.stmt.ExecContext(c.ctx, values...); err != nil {

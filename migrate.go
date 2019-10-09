@@ -123,6 +123,22 @@ func Migrate(
 		"repos":   repos,
 		"elapsed": time.Since(start),
 	}).Debug("migrated all repositories")
+
+	return m.flush()
+}
+
+func (m *migrator) flush() error {
+	var copiers = []*tableCopier{
+		m.repositories,
+		m.refs,
+		m.refCommits,
+		m.commits,
+		m.treeEntries,
+		m.treeBlobs,
+		m.files,
+		m.blobs,
+	}
+
 	for _, copier := range copiers {
 		if err := copier.Close(); err != nil {
 			return fmt.Errorf("could not close copier correctly: %s", err)
@@ -153,8 +169,8 @@ func (m *migrator) migrateRepository(
 	log.WithField("elapsed", time.Since(start)).Debug("migrated references and commits")
 
 	start = time.Now()
-	if err := m.migrateFiles(ctx, r, dedupHashes(trees)); err != nil {
-		return fmt.Errorf("cannot migrate files: %s", err)
+	if err := m.migrateTrees(ctx, r, dedupHashes(trees)); err != nil {
+		return fmt.Errorf("cannot migrate trees: %s", err)
 	}
 	log.WithField("elapsed", time.Since(start)).Debug("migrated trees and files")
 
@@ -287,7 +303,7 @@ func (m *migrator) migrateRefs(
 	return nil
 }
 
-func (m *migrator) migrateFiles(
+func (m *migrator) migrateTrees(
 	ctx context.Context,
 	r borges.Repository,
 	trees []plumbing.Hash,
@@ -359,6 +375,7 @@ func (m *migrator) migrateFiles(
 	var g errgroup.Group
 
 	for _, tree := range trees {
+		tree := tree
 		tokens <- struct{}{}
 		g.Go(func() error {
 			start := time.Now()

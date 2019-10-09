@@ -118,8 +118,10 @@ func (f fileTreeVisitor) visitEntry(
 	default:
 	}
 
-	if err := f.onTreeEntrySeen(tree, entry); err != nil {
-		return err
+	if !f.cache.entrySeen(tree, entry.Name) {
+		if err := f.onTreeEntrySeen(tree, entry); err != nil {
+			return err
+		}
 	}
 
 	path = join(path, "/", entry.Name)
@@ -220,9 +222,17 @@ func join(parts ...string) string {
 	return strings.Join(p, "/")
 }
 
+type entry struct {
+	tree plumbing.Hash
+	name string
+}
+
 type treesCache struct {
 	blobsMut  sync.RWMutex
 	seenBlobs map[plumbing.Hash]struct{}
+
+	entriesMut  sync.RWMutex
+	seenEntries map[entry]struct{}
 
 	treesMut sync.RWMutex
 	trees    map[plumbing.Hash]*treeNode
@@ -230,8 +240,9 @@ type treesCache struct {
 
 func newTreesCache() *treesCache {
 	return &treesCache{
-		seenBlobs: make(map[plumbing.Hash]struct{}),
-		trees:     make(map[plumbing.Hash]*treeNode),
+		seenBlobs:   make(map[plumbing.Hash]struct{}),
+		seenEntries: make(map[entry]struct{}),
+		trees:       make(map[plumbing.Hash]*treeNode),
 	}
 }
 
@@ -249,11 +260,21 @@ func (c *treesCache) tree(hash plumbing.Hash) (*treeNode, bool) {
 }
 
 func (c *treesCache) blobSeen(hash plumbing.Hash) (seenBefore bool) {
-	c.treesMut.Lock()
+	c.blobsMut.Lock()
 	_, ok := c.seenBlobs[hash]
 	if !ok {
 		c.seenBlobs[hash] = struct{}{}
 	}
-	c.treesMut.Unlock()
+	c.blobsMut.Unlock()
+	return ok
+}
+
+func (c *treesCache) entrySeen(hash plumbing.Hash, name string) (seenBefore bool) {
+	c.entriesMut.Lock()
+	_, ok := c.seenEntries[entry{hash, name}]
+	if !ok {
+		c.seenEntries[entry{hash, name}] = struct{}{}
+	}
+	c.entriesMut.Unlock()
 	return ok
 }

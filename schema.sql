@@ -1,12 +1,3 @@
-DROP TABLE IF EXISTS repositories;
-DROP TABLE IF EXISTS refs;
-DROP TABLE IF EXISTS ref_commits;
-DROP TABLE IF EXISTS commits;
-DROP TABLE IF EXISTS tree_entries;
-DROP TABLE IF EXISTS tree_blobs;
-DROP TABLE IF EXISTS tree_files;
-DROP TABLE IF EXISTS blobs;
-
 CREATE TABLE IF NOT EXISTS repositories (
   repository_id TEXT NOT NULL
 );
