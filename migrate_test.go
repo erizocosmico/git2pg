@@ -187,6 +187,7 @@ func assertTreeFiles(t *testing.T, db *sql.DB, repo borges.Repository) {
 	require.NoError(t, err)
 
 	var expected [][]interface{}
+	seen := make(map[string]struct{})
 	require.NoError(t, iter.ForEach(func(c *object.Commit) error {
 		fiter, err := c.Files()
 		if err != nil {
@@ -194,6 +195,12 @@ func assertTreeFiles(t *testing.T, db *sql.DB, repo borges.Repository) {
 		}
 
 		return fiter.ForEach(func(f *object.File) error {
+			key := c.TreeHash.String() + f.Name
+			if _, ok := seen[key]; ok {
+				return nil
+			}
+			seen[key] = struct{}{}
+
 			expected = append(
 				expected,
 				[]interface{}{

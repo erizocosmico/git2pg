@@ -5,7 +5,10 @@ go:
   - tip
 
 env:
-  - GO111MODULE=on GOPROXY=https://proxy.golang.org
+  - GO111MODULE=on GOPROXY=https://proxy.golang.org TESTDBURI=postgres://postgres:@localhost:5432/postgres?sslmode=disable
+
+services:
+  - postgresql
 
 matrix:
   fast_finish: true

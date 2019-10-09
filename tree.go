@@ -124,7 +124,7 @@ func (f fileTreeVisitor) visitEntry(
 		}
 	}
 
-	path = join(path, "/", entry.Name)
+	path = join(path, entry.Name)
 	if entry.Mode == filemode.Dir {
 		if err := f.visitTree(ctx, entry.Hash, path); err != nil {
 			return err
