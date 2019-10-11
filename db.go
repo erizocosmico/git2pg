@@ -58,7 +58,7 @@ var schema = map[string]string{
 		committer_when timestamptz NOT NULL,
 		commit_message TEXT NOT NULL,
 		root_tree_hash VARCHAR(40) NOT NULL,
-		commit_parents JSON NOT NULL
+		commit_parents VARCHAR(40)[] NOT NULL
 	)`,
 
 	"tree_entries": `CREATE TABLE IF NOT EXISTS tree_entries (

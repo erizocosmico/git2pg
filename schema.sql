@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS commits (
   committer_when timestamp NOT NULL,
   commit_message TEXT NOT NULL,
   root_tree_hash VARCHAR(40) NOT NULL,
-  commit_parents JSON NOT NULL
+  commit_parents VARCHAR(40)[] NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tree_entries (

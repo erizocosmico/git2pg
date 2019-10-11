@@ -6,43 +6,106 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/src-d/enry/v2"
+	"github.com/src-d/go-borges"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/filemode"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 )
 
+type fileTreeListener struct {
+	repo        borges.Repository
+	treeEntries *tableCopier
+	treeBlobs   *tableCopier
+	files       *tableCopier
+	blobs       *tableCopier
+}
+
+func (l *fileTreeListener) onTreeEntrySeen(tree plumbing.Hash, entry object.TreeEntry) error {
+	values := []interface{}{
+		l.repo.ID(),
+		entry.Name,
+		entry.Hash.String(),
+		tree.String(),
+		strconv.FormatInt(int64(entry.Mode), 8),
+	}
+	if err := l.treeEntries.copy(values...); err != nil {
+		return fmt.Errorf("cannot copy tree entry: %s", err)
+	}
+
+	return nil
+}
+
+func (l *fileTreeListener) onTreeBlobSeen(tree, blob plumbing.Hash) error {
+	values := []interface{}{
+		l.repo.ID(),
+		tree.String(),
+		blob.String(),
+	}
+
+	if err := l.treeBlobs.copy(values...); err != nil {
+		return fmt.Errorf("cannot copy tree blob: %s", err)
+	}
+
+	return nil
+}
+
+func (l *fileTreeListener) onFileSeen(path string, tree, blob plumbing.Hash) error {
+	values := []interface{}{
+		l.repo.ID(),
+		tree.String(),
+		path,
+		blob.String(),
+		enry.IsVendor(path),
+	}
+
+	if err := l.files.copy(values...); err != nil {
+		return fmt.Errorf("cannot copy file: %s", err)
+	}
+
+	return nil
+}
+
+func (l *fileTreeListener) onBlobSeen(blob *object.Blob, content []byte) error {
+	values := []interface{}{
+		l.repo.ID(),
+		blob.Hash.String(),
+		blob.Size,
+		content,
+		isBinary(content),
+	}
+
+	if err := l.blobs.copy(values...); err != nil {
+		return fmt.Errorf("cannot copy tree blob: %s", err)
+	}
+
+	return nil
+}
+
 func visitFileTree(
 	ctx context.Context,
 	repo *syncRepository,
 	origin plumbing.Hash,
-	onTreeEntrySeen func(plumbing.Hash, object.TreeEntry) error,
-	onTreeBlobSeen func(tree, blob plumbing.Hash) error,
-	onFileSeen func(path string, tree plumbing.Hash, blob plumbing.Hash) error,
-	onBlobSeen func(*object.Blob, []byte) error,
+	listener *fileTreeListener,
 	treesCache *treesCache,
 ) error {
 	return fileTreeVisitor{
 		repo,
 		origin,
-		onTreeEntrySeen,
-		onTreeBlobSeen,
-		onFileSeen,
-		onBlobSeen,
+		listener,
 		treesCache,
 	}.visitTree(ctx, origin, "")
 }
 
 type fileTreeVisitor struct {
-	repo            *syncRepository
-	origin          plumbing.Hash
-	onTreeEntrySeen func(plumbing.Hash, object.TreeEntry) error
-	onTreeBlobSeen  func(tree, blob plumbing.Hash) error
-	onFileSeen      func(path string, tree plumbing.Hash, blob plumbing.Hash) error
-	onBlobSeen      func(*object.Blob, []byte) error
-	cache           *treesCache
+	repo     *syncRepository
+	origin   plumbing.Hash
+	listener *fileTreeListener
+	cache    *treesCache
 }
 
 func (f fileTreeVisitor) visitTree(
@@ -88,15 +151,18 @@ func (f fileTreeVisitor) visitCachedTree(
 ) error {
 	for _, entry := range tree.entries {
 		if entry.isDir {
-			if err := f.visitCachedTree(ctx, join(path, entry.name), entry); err != nil {
+			err := f.visitCachedTree(ctx, join(path, entry.name), entry)
+			if err != nil {
 				return err
 			}
 		} else {
-			if err := f.onFileSeen(join(path, entry.name), f.origin, entry.hash); err != nil {
+			err := f.listener.onFileSeen(join(path, entry.name), f.origin, entry.hash)
+			if err != nil {
 				return err
 			}
 
-			if err := f.onTreeBlobSeen(f.origin, entry.hash); err != nil {
+			err = f.listener.onTreeBlobSeen(f.origin, entry.hash)
+			if err != nil {
 				return err
 			}
 		}
@@ -119,7 +185,7 @@ func (f fileTreeVisitor) visitEntry(
 	}
 
 	if !f.cache.entrySeen(tree, entry.Name) {
-		if err := f.onTreeEntrySeen(tree, entry); err != nil {
+		if err := f.listener.onTreeEntrySeen(tree, entry); err != nil {
 			return err
 		}
 	}
@@ -147,11 +213,11 @@ func (f fileTreeVisitor) visitEntry(
 }
 
 func (f fileTreeVisitor) visitFile(hash plumbing.Hash, path string) error {
-	if err := f.onFileSeen(path, f.origin, hash); err != nil {
+	if err := f.listener.onFileSeen(path, f.origin, hash); err != nil {
 		return err
 	}
 
-	if err := f.onTreeBlobSeen(f.origin, hash); err != nil {
+	if err := f.listener.onTreeBlobSeen(f.origin, hash); err != nil {
 		return err
 	}
 
@@ -169,7 +235,7 @@ func (f fileTreeVisitor) visitFile(hash plumbing.Hash, path string) error {
 		return err
 	}
 
-	return f.onBlobSeen(blob, content)
+	return f.listener.onBlobSeen(blob, content)
 }
 
 const sniffLen = 8000

@@ -21,18 +21,20 @@ import (
 
 func main() {
 	var path string
-	var useSiva, rooted, verbose, drop, create bool
 	var buckets, workers, repoWorkers int
+	var useSiva, rooted, verbose, drop, create, full bool
 
 	flag.StringVar(&path, "d", "", "path to the repositories library")
+	flag.IntVar(&buckets, "buckets", 0, "number of characters of buckets in the repository library")
+	flag.IntVar(&repoWorkers, "repo-workers", runtime.NumCPU()/2, "workers to use for processing each repository")
+	flag.IntVar(&workers, "workers", runtime.NumCPU()/2, "workers to use")
 	flag.BoolVar(&create, "create", false, "create the database tables")
 	flag.BoolVar(&drop, "drop", false, "drop the database tables if they already exist")
-	flag.BoolVar(&useSiva, "siva", false, "use siva repositories")
+	flag.BoolVar(&full, "full", false, "migrate all trees instead of just the ones in the HEAD of all references")
 	flag.BoolVar(&rooted, "rooted", false, "use rooted repositories")
-	flag.IntVar(&buckets, "buckets", 0, "number of characters of buckets in the repository library")
-	flag.IntVar(&workers, "workers", runtime.NumCPU()/2, "workers to use")
-	flag.IntVar(&repoWorkers, "repo-workers", runtime.NumCPU()/2, "workers to use for processing each repository")
+	flag.BoolVar(&useSiva, "siva", false, "use siva repositories")
 	flag.BoolVar(&verbose, "v", false, "verbose mode")
+
 	flag.Parse()
 
 	if drop && !create {
@@ -71,7 +73,12 @@ func main() {
 		cancel()
 	}()
 
-	if err := git2pg.Migrate(ctx, lib, db, workers, repoWorkers); err != nil {
+	err = git2pg.Migrate(ctx, lib, db, git2pg.Options{
+		Workers:     workers,
+		RepoWorkers: repoWorkers,
+		Full:        full,
+	})
+	if err != nil {
 		logrus.Fatalf("unable to migrate library to database: %s", err)
 	}
 

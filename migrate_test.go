@@ -3,7 +3,6 @@ package git2pg
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 	"github.com/src-d/enry/v2"
 	"github.com/src-d/go-borges"
@@ -26,8 +26,9 @@ import (
 )
 
 func TestMigrateRepository(t *testing.T) {
-	db := setupDB(t)
+	db, cleanDB := setupDB(t)
 	defer db.Close()
+	defer cleanDB()
 
 	repo, cleanup := setupRepo(t)
 	defer cleanup()
@@ -39,7 +40,7 @@ func TestMigrateRepository(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	require.NoError(m.migrateRepository(ctx, repo))
+	require.NoError(m.migrateRepository(ctx, repo, true))
 	require.NoError(m.flush())
 
 	assertRepo(t, db, repo)
@@ -70,7 +71,7 @@ func assertRefs(t *testing.T, db *sql.DB, repo borges.Repository) {
 	require.NoError(t, err)
 
 	expected := [][]interface{}{
-		{string(repo.ID()), head.Name().String(), head.Hash().String()},
+		{string(repo.ID()), "HEAD", head.Hash().String()},
 	}
 
 	require.NoError(t, iter.ForEach(func(r *plumbing.Reference) error {
@@ -88,6 +89,9 @@ func assertRefs(t *testing.T, db *sql.DB, repo borges.Repository) {
 		)
 		return nil
 	}))
+
+	sortByHash(expected, 2)
+	sortByHash(rows, 2)
 
 	require.Equal(t, expected, rows)
 }
@@ -232,9 +236,6 @@ func assertCommits(t *testing.T, db *sql.DB, repo borges.Repository) {
 			parentHashes[i] = h.String()
 		}
 
-		parents, err := json.Marshal(parentHashes)
-		require.NoError(t, err)
-
 		expected = append(
 			expected,
 			[]interface{}{
@@ -248,7 +249,7 @@ func assertCommits(t *testing.T, db *sql.DB, repo borges.Repository) {
 				c.Committer.When.UTC().Format(time.RFC3339),
 				sanitizeString(c.Message),
 				c.TreeHash.String(),
-				parents,
+				parentHashes,
 			},
 		)
 		return nil
@@ -388,7 +389,7 @@ func scanCommit(rows *sql.Rows) ([]interface{}, error) {
 	var id, hash, authorName, authorMail string
 	var committerName, committerMail, message, tree string
 	var authorWhen, committerWhen time.Time
-	var parents []byte
+	var parents []string
 	if err := rows.Scan(
 		&id,
 		&hash,
@@ -400,7 +401,7 @@ func scanCommit(rows *sql.Rows) ([]interface{}, error) {
 		&committerWhen,
 		&message,
 		&tree,
-		&parents,
+		pq.Array(&parents),
 	); err != nil {
 		return nil, err
 	}
@@ -439,7 +440,7 @@ func scanBlob(rows *sql.Rows) ([]interface{}, error) {
 	return []interface{}{id, hash, size, content, isBinary}, nil
 }
 
-func setupDB(t *testing.T) *sql.DB {
+func setupDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
 
 	dburl := os.Getenv("TESTDBURI")
@@ -453,7 +454,9 @@ func setupDB(t *testing.T) *sql.DB {
 	require.NoError(t, DropTables(db))
 	require.NoError(t, CreateTables(db))
 
-	return db
+	return db, func() {
+		require.NoError(t, DropTables(db))
+	}
 }
 
 func setupRepo(t *testing.T) (borges.Repository, func()) {

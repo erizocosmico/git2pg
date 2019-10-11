@@ -3,42 +3,96 @@ package git2pg
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"time"
 	"unicode/utf8"
 
+	"github.com/lib/pq"
 	"github.com/src-d/go-borges"
-	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 )
 
+type refCommitsListener struct {
+	repo             borges.Repository
+	refHash          plumbing.Hash
+	full             bool
+	refCommits       *tableCopier
+	commits          *tableCopier
+	onCommitTreeSeen func(plumbing.Hash)
+}
+
+func (l *refCommitsListener) onRefCommitSeen(
+	ref *plumbing.Reference,
+	commit plumbing.Hash,
+	idx int,
+) error {
+	return l.refCommits.copy(
+		l.repo.ID(),
+		commit.String(),
+		ref.Name().String(),
+		uint64(idx),
+	)
+}
+
+func (l *refCommitsListener) onCommitSeen(c *object.Commit) error {
+	if l.full || l.refHash == c.Hash {
+		l.onCommitTreeSeen(c.TreeHash)
+	}
+
+	parents := make([]string, len(c.ParentHashes))
+	for i, h := range c.ParentHashes {
+		parents[i] = h.String()
+	}
+
+	values := []interface{}{
+		l.repo.ID(),
+		c.Hash.String(),
+		sanitizeString(c.Author.Name),
+		sanitizeString(c.Author.Email),
+		c.Author.When.Format(time.RFC3339),
+		sanitizeString(c.Committer.Name),
+		sanitizeString(c.Committer.Email),
+		c.Committer.When.Format(time.RFC3339),
+		sanitizeString(c.Message),
+		c.TreeHash.String(),
+		pq.Array(parents),
+	}
+
+	if err := l.commits.copy(values...); err != nil {
+		return fmt.Errorf("cannot copy commit %s: %s", c.Hash, err)
+	}
+
+	return nil
+}
+
 func visitRefCommits(
 	ctx context.Context,
-	repo borges.Repository,
+	repo *syncRepository,
 	ref *plumbing.Reference,
 	start *object.Commit,
-	onCommitSeen func(*object.Commit) error,
-	onRefCommitSeen func(*plumbing.Reference, plumbing.Hash, int) error,
-	graphCache map[plumbing.Hash][]plumbing.Hash,
+	listener *refCommitsListener,
+	graphCache *graphCache,
 ) error {
-	return refCommitsVisitor{
-		ctx,
-		repo,
-		ref,
-		onCommitSeen,
-		onRefCommitSeen,
-		graphCache,
-		make(map[plumbing.Hash]struct{}),
-	}.visitCommits(start)
+	return (&refCommitsVisitor{
+		ctx:        ctx,
+		repo:       repo,
+		ref:        ref,
+		listener:   listener,
+		graphCache: graphCache,
+		seen:       make(map[plumbing.Hash]struct{}),
+	}).visitCommits(start)
 }
 
 type refCommitsVisitor struct {
-	ctx             context.Context
-	repo            borges.Repository
-	ref             *plumbing.Reference
-	onCommitSeen    func(*object.Commit) error
-	onRefCommitSeen func(*plumbing.Reference, plumbing.Hash, int) error
-	graphCache      map[plumbing.Hash][]plumbing.Hash
-	seen            map[plumbing.Hash]struct{}
+	ctx        context.Context
+	repo       *syncRepository
+	ref        *plumbing.Reference
+	listener   *refCommitsListener
+	graphCache *graphCache
+	seen       map[plumbing.Hash]struct{}
+	mut        sync.RWMutex
 }
 
 type stackFrame struct {
@@ -47,7 +101,7 @@ type stackFrame struct {
 	hashes []plumbing.Hash
 }
 
-func (r refCommitsVisitor) visitCommits(start *object.Commit) error {
+func (r *refCommitsVisitor) visitCommits(start *object.Commit) error {
 	stack := []*stackFrame{
 		{0, 0, []plumbing.Hash{start.Hash}},
 	}
@@ -69,31 +123,37 @@ func (r refCommitsVisitor) visitCommits(start *object.Commit) error {
 			stack = stack[:len(stack)-1]
 		}
 
-		if node, ok := r.graphCache[h]; ok {
-			if err := r.visitCachedNode(frame.idx, h, node); err != nil {
+		if parents, ok := r.graphCache.parents(h); ok {
+			if err := r.visitCachedNode(frame.idx, h, parents); err != nil {
 				return err
 			}
 			continue
 		}
 
-		c, err := r.repo.R().CommitObject(h)
+		c, err := r.repo.commit(h)
 		if err != nil {
 			return err
 		}
 
-		if err := r.onCommitSeen(c); err != nil {
-			return err
+		if _, ok := r.graphCache.parents(c.Hash); !ok {
+			if err := r.listener.onCommitSeen(c); err != nil {
+				return err
+			}
 		}
 
+		r.mut.Lock()
 		r.seen[c.Hash] = struct{}{}
-		r.graphCache[c.Hash] = c.ParentHashes
+		r.mut.Unlock()
+		r.graphCache.put(c.Hash, c.ParentHashes)
 
 		if c.NumParents() > 0 {
 			parents := make([]plumbing.Hash, 0, c.NumParents())
 			for _, h = range c.ParentHashes {
+				r.mut.RLock()
 				if _, ok := r.seen[h]; !ok {
 					parents = append(parents, h)
 				}
+				r.mut.RUnlock()
 			}
 
 			if len(parents) > 0 {
@@ -101,13 +161,14 @@ func (r refCommitsVisitor) visitCommits(start *object.Commit) error {
 			}
 		}
 
-		if err := r.onRefCommitSeen(r.ref, c.Hash, frame.idx); err != nil {
+		err = r.listener.onRefCommitSeen(r.ref, c.Hash, frame.idx)
+		if err != nil {
 			return err
 		}
 	}
 }
 
-func (r refCommitsVisitor) visitCachedNode(
+func (r *refCommitsVisitor) visitCachedNode(
 	idx int,
 	h plumbing.Hash,
 	parents []plumbing.Hash,
@@ -134,20 +195,25 @@ func (r refCommitsVisitor) visitCachedNode(
 			stack = stack[:len(stack)-1]
 		}
 
+		r.mut.Lock()
 		r.seen[h] = struct{}{}
+		r.mut.Unlock()
 
 		var parents []plumbing.Hash
-		for _, h = range r.graphCache[h] {
+		ps, _ := r.graphCache.parents(h)
+		for _, h = range ps {
+			r.mut.RLock()
 			if _, ok := r.seen[h]; !ok {
 				parents = append(parents, h)
 			}
+			r.mut.RUnlock()
 		}
 
 		if len(parents) > 0 {
 			stack = append(stack, &stackFrame{frame.idx + 1, 0, parents})
 		}
 
-		if err := r.onRefCommitSeen(r.ref, h, frame.idx); err != nil {
+		if err := r.listener.onRefCommitSeen(r.ref, h, frame.idx); err != nil {
 			return err
 		}
 	}
@@ -159,8 +225,8 @@ func isIgnoredReference(r *plumbing.Reference) bool {
 
 var errInvalidCommit = errors.New("invalid commit")
 
-func resolveCommit(repo *git.Repository, hash plumbing.Hash) (*object.Commit, error) {
-	obj, err := repo.Object(plumbing.AnyObject, hash)
+func resolveCommit(repo *syncRepository, hash plumbing.Hash) (*object.Commit, error) {
+	obj, err := repo.object(hash)
 	if err != nil {
 		return nil, err
 	}
@@ -191,4 +257,26 @@ func sanitizeString(s string) string {
 	}
 
 	return s
+}
+
+type graphCache struct {
+	mut   sync.RWMutex
+	cache map[plumbing.Hash][]plumbing.Hash
+}
+
+func newGraphCache() *graphCache {
+	return &graphCache{cache: make(map[plumbing.Hash][]plumbing.Hash)}
+}
+
+func (g *graphCache) parents(hash plumbing.Hash) ([]plumbing.Hash, bool) {
+	g.mut.RLock()
+	parents, ok := g.cache[hash]
+	g.mut.RUnlock()
+	return parents, ok
+}
+
+func (g *graphCache) put(hash plumbing.Hash, parents []plumbing.Hash) {
+	g.mut.Lock()
+	g.cache[hash] = parents
+	g.mut.Unlock()
 }

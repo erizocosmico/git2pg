@@ -2,10 +2,6 @@
 
 Migrate git repositories to a PostgreSQL database.
 
-## Status
-
-git2pg is still under development and lacks both features and proper testing. Right now, its development has been focusing on making it perform well rather than correctness, which will come afterwards.
-
 ## Install
 
 Manually using go get:
@@ -54,6 +50,7 @@ To configure how git2pg works, you will need to use environment variables to spe
 - `-v` verbose mode that will spit more logs. Only meant for debugging purposes. Not enabled by default.
 - `-create` create the tables necessary in the schema.
 - `-drop` drop the tables if they exist before creating them again. This option cannot be used unless `-create` is used as well.
+- `-full` migrate all the trees in the repository for each commit of each reference. By default, only the trees of the HEAD of each reference is migrated, because the space and time it takes lowers dramatically and is the most common case. If you need the full repository data, use this option.
 
 **Note on setting worker numbers**
 
@@ -81,6 +78,11 @@ The schema contains the following tables:
 - `tree_blobs`: containing the blob hashes that are in each root tree of each repository.
 - `tree_blobs`: containing the files that are in each root tree of each repository.
 - `blobs`: containing all the blobs in each repository, including its file content.
+
+## TODO
+
+- [ ] Tests for `ref_commits` correctness.
+- [ ] `remotes` table.
 
 ## LICENSE
 

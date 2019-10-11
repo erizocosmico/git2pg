@@ -3,22 +3,18 @@ package git2pg
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/src-d/enry/v2"
 	"github.com/src-d/go-borges"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/src-d/go-git.v4/plumbing"
-	"gopkg.in/src-d/go-git.v4/plumbing/object"
 )
 
-// TODO(erizocosmico): association between root trees and tree entries and
-// remotes.
+// TODO(erizocosmico): add remotes table
 
 type migrator struct {
 	lib         borges.Library
@@ -46,12 +42,26 @@ var tables = []string{
 	"blobs",
 }
 
+// Options to configure the migration of a library to the database.
+type Options struct {
+	// Workers to use for migration. That means, number of repositories that
+	// can be processed at the same time.
+	Workers int
+	// RepoWorkers is the number of workers to use while processing a single
+	// repository. So, workers * repo workers is the total number of workers
+	// that can be running at any given time during the migration.
+	RepoWorkers int
+	// Full migrates all data from all trees in the repository, instead of just
+	// the ones referenced in the HEAD commits of each reference.
+	Full bool
+}
+
 // Migrate the given git repositories library to the given database.
 func Migrate(
 	ctx context.Context,
 	lib borges.Library,
 	db *sql.DB,
-	workers, repoWorkers int,
+	opts Options,
 ) error {
 	var copiers = make(map[string]*tableCopier)
 	for _, t := range tables {
@@ -73,7 +83,7 @@ func Migrate(
 		treeBlobs:    copiers["tree_blobs"],
 		files:        copiers["tree_files"],
 		blobs:        copiers["blobs"],
-		repoWorkers:  repoWorkers,
+		repoWorkers:  opts.RepoWorkers,
 	}
 
 	iter, err := lib.Repositories(borges.ReadOnlyMode)
@@ -81,7 +91,7 @@ func Migrate(
 		return fmt.Errorf("cannot get repositories from library: %s", err)
 	}
 
-	var tokens = make(chan struct{}, workers)
+	var tokens = make(chan struct{}, opts.Workers)
 	var g errgroup.Group
 	var repos int
 	start := time.Now()
@@ -106,7 +116,7 @@ func Migrate(
 			}()
 
 			log.Debug("migrating repository")
-			if err := m.migrateRepository(ctx, repo); err != nil {
+			if err := m.migrateRepository(ctx, repo, opts.Full); err != nil {
 				return err
 			}
 			log.WithField("elapsed", time.Since(start)).Info("migrated repository")
@@ -151,19 +161,16 @@ func (m *migrator) flush() error {
 func (m *migrator) migrateRepository(
 	ctx context.Context,
 	r borges.Repository,
+	full bool,
 ) error {
 	if err := m.repositories.copy(r.ID()); err != nil {
 		return fmt.Errorf("unable to copy repository: %s", err)
 	}
 
-	var trees []plumbing.Hash
-	onCommitSeen := func(c *object.Commit) {
-		trees = append(trees, c.TreeHash)
-	}
-
 	log := logrus.WithField("repo", r.ID())
 	start := time.Now()
-	if err := m.migrateRefs(ctx, r, onCommitSeen); err != nil {
+	trees, err := m.migrateRefs(ctx, r, full)
+	if err != nil {
 		return fmt.Errorf("cannot migrate refs: %s", err)
 	}
 	log.WithField("elapsed", time.Since(start)).Debug("migrated references and commits")
@@ -180,127 +187,85 @@ func (m *migrator) migrateRepository(
 func (m *migrator) migrateRefs(
 	ctx context.Context,
 	repo borges.Repository,
-	commitSeen func(*object.Commit),
-) error {
-	graphCache := make(map[plumbing.Hash][]plumbing.Hash)
+	full bool,
+) (rootTrees []plumbing.Hash, err error) {
+	var (
+		treesMut   sync.Mutex
+		g          errgroup.Group
+		tokens     = make(chan struct{}, m.repoWorkers)
+		graphCache = newGraphCache()
+		r          = newSyncRepository(repo)
+		iter       = &refIterator{repo: r}
+	)
 
-	onCommitSeen := func(c *object.Commit) error {
-		if _, ok := graphCache[c.Hash]; ok {
-			return nil
-		}
-
-		commitSeen(c)
-
-		parentHashes := make([]string, len(c.ParentHashes))
-		for i, h := range c.ParentHashes {
-			parentHashes[i] = h.String()
-		}
-
-		parents, err := json.Marshal(parentHashes)
-		if err != nil {
-			return fmt.Errorf("cannot marshal commit parents: %s", err)
-		}
-
-		values := []interface{}{
-			repo.ID(),
-			c.Hash.String(),
-			sanitizeString(c.Author.Name),
-			sanitizeString(c.Author.Email),
-			c.Author.When.Format(time.RFC3339),
-			sanitizeString(c.Committer.Name),
-			sanitizeString(c.Committer.Email),
-			c.Committer.When.Format(time.RFC3339),
-			sanitizeString(c.Message),
-			c.TreeHash.String(),
-			parents,
-		}
-
-		if err := m.commits.copy(values...); err != nil {
-			return fmt.Errorf("cannot copy commit %s: %s", c.Hash, err)
-		}
-
-		return nil
-	}
-
-	onRefCommitSeen := func(ref *plumbing.Reference, commit plumbing.Hash, idx int) error {
-		return m.refCommits.copy(
-			repo.ID(),
-			commit.String(),
-			ref.Name().String(),
-			uint64(idx),
-		)
-	}
-
-	head, err := repo.R().Head()
-	if err != nil && err != plumbing.ErrReferenceNotFound {
-		return fmt.Errorf("cannot get HEAD reference: %s", err)
-	}
-
-	refs, err := repo.R().References()
-	if err != nil {
-		return fmt.Errorf("cannot get references: %s", err)
-	}
-	defer refs.Close()
+	defer iter.close()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return context.Canceled
+			return nil, context.Canceled
 		default:
 		}
 
-		var ref *plumbing.Reference
-		if head == nil {
-			ref, err = refs.Next()
+		ref, commit, err := iter.next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("cannot get next reference: %s", err)
+		}
+
+		tokens <- struct{}{}
+
+		start := time.Now()
+		g.Go(func() error {
+			defer func() {
+				<-tokens
+				logrus.WithFields(logrus.Fields{
+					"elapsed": time.Since(start),
+					"ref":     ref.Name().String(),
+					"repo":    r.ID(),
+				}).Debug("migrated reference")
+			}()
+
+			err := m.refs.copy(
+				repo.ID(),
+				ref.Name().String(),
+				commit.Hash.String(),
+			)
 			if err != nil {
-				if err == io.EOF {
-					break
-				}
-
-				return fmt.Errorf("cannot get next reference: %s", err)
+				return err
 			}
 
-			if isIgnoredReference(ref) {
-				continue
+			listener := &refCommitsListener{
+				repo:       r,
+				refHash:    commit.Hash,
+				full:       full,
+				refCommits: m.refCommits,
+				commits:    m.commits,
+				onCommitTreeSeen: func(h plumbing.Hash) {
+					treesMut.Lock()
+					rootTrees = append(rootTrees, h)
+					treesMut.Unlock()
+				},
 			}
-		} else {
-			ref = head
-			head = nil
-		}
 
-		commit, err := resolveCommit(repo.R(), ref.Hash())
-		if err != nil {
-			if err == errInvalidCommit {
-				continue
-			}
-
-			return fmt.Errorf("cannot resolve commit: %s", err)
-		}
-
-		err = m.refs.copy(
-			repo.ID(),
-			ref.Name().String(),
-			commit.Hash.String(),
-		)
-		if err != nil {
-			return err
-		}
-
-		err = visitRefCommits(
-			ctx,
-			repo,
-			ref,
-			commit,
-			onCommitSeen,
-			onRefCommitSeen,
-			graphCache,
-		)
-		if err != nil {
-			return err
-		}
+			return visitRefCommits(
+				ctx,
+				r,
+				ref,
+				commit,
+				listener,
+				graphCache,
+			)
+		})
 	}
 
-	return nil
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return rootTrees, nil
 }
 
 func (m *migrator) migrateTrees(
@@ -308,100 +273,44 @@ func (m *migrator) migrateTrees(
 	r borges.Repository,
 	trees []plumbing.Hash,
 ) error {
-	onTreeEntrySeen := func(tree plumbing.Hash, entry object.TreeEntry) error {
-		values := []interface{}{
-			r.ID(),
-			entry.Name,
-			entry.Hash.String(),
-			tree.String(),
-			strconv.FormatInt(int64(entry.Mode), 8),
-		}
-		if err := m.treeEntries.copy(values...); err != nil {
-			return fmt.Errorf("cannot copy tree entry: %s", err)
-		}
-
-		return nil
-	}
-
-	onTreeBlobSeen := func(tree, blob plumbing.Hash) error {
-		values := []interface{}{
-			r.ID(),
-			tree.String(),
-			blob.String(),
-		}
-
-		if err := m.treeBlobs.copy(values...); err != nil {
-			return fmt.Errorf("cannot copy tree blob: %s", err)
-		}
-
-		return nil
-	}
-
-	onFileSeen := func(path string, tree, blob plumbing.Hash) error {
-		values := []interface{}{
-			r.ID(),
-			tree.String(),
-			path,
-			blob.String(),
-			enry.IsVendor(path),
-		}
-
-		if err := m.files.copy(values...); err != nil {
-			return fmt.Errorf("cannot copy file: %s", err)
-		}
-
-		return nil
-	}
-
-	onBlobSeen := func(blob *object.Blob, content []byte) error {
-		values := []interface{}{
-			r.ID(),
-			blob.Hash.String(),
-			blob.Size,
-			content,
-			isBinary(content),
-		}
-
-		if err := m.blobs.copy(values...); err != nil {
-			return fmt.Errorf("cannot copy tree blob: %s", err)
-		}
-
-		return nil
+	listener := &fileTreeListener{
+		repo:        r,
+		treeEntries: m.treeEntries,
+		treeBlobs:   m.treeBlobs,
+		files:       m.files,
+		blobs:       m.blobs,
 	}
 
 	treesCache := newTreesCache()
 	tokens := make(chan struct{}, m.repoWorkers)
-	repo := &syncRepository{Repository: r}
+	repo := newSyncRepository(r)
 	var g errgroup.Group
 
+	start := time.Now()
 	for _, tree := range trees {
 		tree := tree
 		tokens <- struct{}{}
 		g.Go(func() error {
 			start := time.Now()
 			defer func() {
+				<-tokens
 				logrus.WithFields(logrus.Fields{
 					"elapsed": time.Since(start),
 					"tree":    tree.String(),
 					"repo":    r.ID(),
 				}).Debug("migrated tree")
-				<-tokens
 			}()
 
-			return visitFileTree(
-				ctx,
-				repo,
-				tree,
-				onTreeEntrySeen,
-				onTreeBlobSeen,
-				onFileSeen,
-				onBlobSeen,
-				treesCache,
-			)
+			return visitFileTree(ctx, repo, tree, listener, treesCache)
 		})
 	}
 
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	logrus.WithField("elapsed", time.Since(start)).Debugf("migrated %d trees", len(trees))
+	return nil
 }
 
 func dedupHashes(hashes []plumbing.Hash) []plumbing.Hash {
