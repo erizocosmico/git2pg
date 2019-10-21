@@ -3,6 +3,7 @@ module github.com/erizocosmico/git2pg
 go 1.12
 
 require (
+	github.com/davecgh/go-spew v1.1.1
 	github.com/lib/pq v1.2.0
 	github.com/sirupsen/logrus v1.4.2
 	github.com/src-d/enry/v2 v2.1.0

@@ -82,7 +82,7 @@ func visitRefCommits(
 		listener:   listener,
 		graphCache: graphCache,
 		seen:       make(map[plumbing.Hash]struct{}),
-	}).visitCommits(start)
+	}).visitCommits(0, start.Hash)
 }
 
 type refCommitsVisitor struct {
@@ -101,10 +101,11 @@ type stackFrame struct {
 	hashes []plumbing.Hash
 }
 
-func (r *refCommitsVisitor) visitCommits(start *object.Commit) error {
+func (r *refCommitsVisitor) visitCommits(idx int, start plumbing.Hash) error {
 	stack := []*stackFrame{
-		{0, 0, []plumbing.Hash{start.Hash}},
+		{idx, 0, []plumbing.Hash{start}},
 	}
+
 	for {
 		if len(stack) == 0 {
 			return nil
@@ -118,13 +119,14 @@ func (r *refCommitsVisitor) visitCommits(start *object.Commit) error {
 
 		frame := stack[len(stack)-1]
 		h := frame.hashes[frame.pos]
+		r.seen[h] = struct{}{}
 		frame.pos++
 		if frame.pos >= len(frame.hashes) {
 			stack = stack[:len(stack)-1]
 		}
 
-		if parents, ok := r.graphCache.parents(h); ok {
-			if err := r.visitCachedNode(frame.idx, h, parents); err != nil {
+		if _, ok := r.graphCache.parents(h); ok {
+			if err := r.visitCachedNode(frame.idx, h); err != nil {
 				return err
 			}
 			continue
@@ -141,19 +143,15 @@ func (r *refCommitsVisitor) visitCommits(start *object.Commit) error {
 			}
 		}
 
-		r.mut.Lock()
-		r.seen[c.Hash] = struct{}{}
-		r.mut.Unlock()
 		r.graphCache.put(c.Hash, c.ParentHashes)
 
 		if c.NumParents() > 0 {
 			parents := make([]plumbing.Hash, 0, c.NumParents())
-			for _, h = range c.ParentHashes {
-				r.mut.RLock()
+			for _, h := range c.ParentHashes {
 				if _, ok := r.seen[h]; !ok {
 					parents = append(parents, h)
+					r.seen[h] = struct{}{}
 				}
-				r.mut.RUnlock()
 			}
 
 			if len(parents) > 0 {
@@ -171,12 +169,10 @@ func (r *refCommitsVisitor) visitCommits(start *object.Commit) error {
 func (r *refCommitsVisitor) visitCachedNode(
 	idx int,
 	h plumbing.Hash,
-	parents []plumbing.Hash,
 ) error {
 	stack := []*stackFrame{
-		{0, 0, []plumbing.Hash{h}},
+		{idx, 0, []plumbing.Hash{h}},
 	}
-
 	for {
 		if len(stack) == 0 {
 			return nil
@@ -190,27 +186,32 @@ func (r *refCommitsVisitor) visitCachedNode(
 
 		frame := stack[len(stack)-1]
 		h := frame.hashes[frame.pos]
+		r.seen[h] = struct{}{}
 		frame.pos++
 		if frame.pos >= len(frame.hashes) {
 			stack = stack[:len(stack)-1]
 		}
 
-		r.mut.Lock()
-		r.seen[h] = struct{}{}
-		r.mut.Unlock()
-
-		var parents []plumbing.Hash
-		ps, _ := r.graphCache.parents(h)
-		for _, h = range ps {
-			r.mut.RLock()
-			if _, ok := r.seen[h]; !ok {
-				parents = append(parents, h)
+		if _, ok := r.graphCache.parents(h); !ok {
+			if err := r.visitCommits(frame.idx, h); err != nil {
+				return err
 			}
-			r.mut.RUnlock()
+			continue
 		}
 
+		parents, _ := r.graphCache.parents(h)
 		if len(parents) > 0 {
-			stack = append(stack, &stackFrame{frame.idx + 1, 0, parents})
+			ps := make([]plumbing.Hash, 0, len(parents))
+			for _, h := range parents {
+				if _, ok := r.seen[h]; !ok {
+					ps = append(ps, h)
+					r.seen[h] = struct{}{}
+				}
+			}
+
+			if len(ps) > 0 {
+				stack = append(stack, &stackFrame{frame.idx + 1, 0, ps})
+			}
 		}
 
 		if err := r.listener.onRefCommitSeen(r.ref, h, frame.idx); err != nil {

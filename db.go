@@ -90,4 +90,11 @@ var schema = map[string]string{
 		blob_content BYTEA NOT NULL,
 		is_binary BOOLEAN NOT NULL DEFAULT false
 	)`,
+
+	"remotes": `CREATE TABLE IF NOT EXISTS remotes (
+		repository_id TEXT NOT NULL,
+		remote_name TEXT NOT NULL,
+		urls TEXT[] NOT NULL,
+		fetch_refspecs TEXT[] NOT NULL
+	)`,
 }

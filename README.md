@@ -71,6 +71,7 @@ The schema is provided in `schema.sql` for reference purposes, but you can creat
 The schema contains the following tables:
 
 - `repositories`: containing only ids of repositories.
+- `remotes`: containing the remotes with their URLs and fetch refspecs.
 - `refs`: containing the references of each repository and the commits they point to. References to objects other than commits are not included.
 - `ref_commits`: which has each commit in each reference in each repository with a `history_index`, which is the offset to the HEAD of the reference.
 - `commits`: containing all the commit information. Each table has the reference of the root tree at this point. That can be used to join with other tables that have information of root trees.
@@ -78,11 +79,6 @@ The schema contains the following tables:
 - `tree_blobs`: containing the blob hashes that are in each root tree of each repository.
 - `tree_blobs`: containing the files that are in each root tree of each repository.
 - `blobs`: containing all the blobs in each repository, including its file content.
-
-## TODO
-
-- [ ] Tests for `ref_commits` correctness.
-- [ ] `remotes` table.
 
 ## LICENSE
 

@@ -8,13 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"github.com/src-d/go-borges"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 )
-
-// TODO(erizocosmico): add remotes table
 
 type migrator struct {
 	lib         borges.Library
@@ -29,10 +28,12 @@ type migrator struct {
 	treeBlobs    *tableCopier
 	files        *tableCopier
 	blobs        *tableCopier
+	remotes      *tableCopier
 }
 
 var tables = []string{
 	"repositories",
+	"remotes",
 	"refs",
 	"ref_commits",
 	"commits",
@@ -83,6 +84,7 @@ func Migrate(
 		treeBlobs:    copiers["tree_blobs"],
 		files:        copiers["tree_files"],
 		blobs:        copiers["blobs"],
+		remotes:      copiers["remotes"],
 		repoWorkers:  opts.RepoWorkers,
 	}
 
@@ -147,6 +149,7 @@ func (m *migrator) flush() error {
 		m.treeBlobs,
 		m.files,
 		m.blobs,
+		m.remotes,
 	}
 
 	for _, copier := range copiers {
@@ -169,6 +172,12 @@ func (m *migrator) migrateRepository(
 
 	log := logrus.WithField("repo", r.ID())
 	start := time.Now()
+	if err := m.migrateRemotes(ctx, r); err != nil {
+		return fmt.Errorf("cannot migrate remotes: %s", err)
+	}
+	log.WithField("elapsed", time.Since(start)).Debug("migrated remotes")
+
+	start = time.Now()
 	trees, err := m.migrateRefs(ctx, r, full)
 	if err != nil {
 		return fmt.Errorf("cannot migrate refs: %s", err)
@@ -182,6 +191,35 @@ func (m *migrator) migrateRepository(
 	log.WithField("elapsed", time.Since(start)).Debug("migrated trees and files")
 
 	return r.Close()
+}
+
+func (m *migrator) migrateRemotes(
+	ctx context.Context,
+	repo borges.Repository,
+) error {
+	conf, err := repo.R().Config()
+	if err != nil {
+		return fmt.Errorf("unable to get repository config: %s", err)
+	}
+
+	for _, r := range conf.Remotes {
+		var refspecs = make([]string, len(r.Fetch))
+		for i, r := range r.Fetch {
+			refspecs[i] = string(r)
+		}
+
+		err := m.remotes.copy(
+			repo.ID(),
+			r.Name,
+			pq.Array(r.URLs),
+			pq.Array(refspecs),
+		)
+		if err != nil {
+			return fmt.Errorf("unable to copy remote: %s", err)
+		}
+	}
+
+	return nil
 }
 
 func (m *migrator) migrateRefs(

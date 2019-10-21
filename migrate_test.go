@@ -54,10 +54,104 @@ func assertRepo(t *testing.T, db *sql.DB, repo borges.Repository) {
 
 	assertRefs(t, db, repo)
 	assertCommits(t, db, repo)
+	assertRefCommits(t, db, repo)
 	assertTreeEntries(t, db, repo)
 	assertBlobs(t, db, repo)
 	assertTreeBlobs(t, db, repo)
 	assertTreeFiles(t, db, repo)
+	assertRemotes(t, db, repo)
+}
+
+func assertRemotes(t *testing.T, db *sql.DB, repo borges.Repository) {
+	t.Helper()
+	rows := repoTableRows(t, db, "remotes", repo, scanRemote)
+
+	expected := [][]interface{}{{
+		"testrepo",
+		"origin",
+		[]string{"git@github.com:git-fixtures/basic.git"},
+		[]string{"+refs/heads/*:refs/remotes/origin/*"},
+	}}
+
+	require.Equal(t, expected, rows)
+}
+
+func assertRefCommits(t *testing.T, db *sql.DB, repo borges.Repository) {
+	t.Helper()
+	rows := repoTableRows(t, db, "ref_commits", repo, scanRefCommit)
+
+	head, err := repo.R().Head()
+	require.NoError(t, err)
+
+	refs := []*plumbing.Reference{
+		plumbing.NewHashReference("HEAD", head.Hash()),
+	}
+
+	iter, err := repo.R().References()
+	require.NoError(t, err)
+	require.NoError(t, iter.ForEach(func(r *plumbing.Reference) error {
+		if !isIgnoredReference(r) {
+			refs = append(refs, r)
+		}
+		return nil
+	}))
+
+	var expected [][]interface{}
+	for _, r := range refs {
+		seen := make(map[plumbing.Hash]struct{})
+		expected = append(expected, getRefCommits(t, repo, r, r.Hash(), 0, seen)...)
+	}
+
+	sort.Slice(expected, func(i, j int) bool {
+		return strings.Compare(
+			fmt.Sprintf("%s_%d_%s", expected[i][2], expected[i][3], expected[i][1]),
+			fmt.Sprintf("%s_%d_%s", expected[j][2], expected[j][3], expected[j][1]),
+		) < 0
+	})
+
+	sort.Slice(rows, func(i, j int) bool {
+		return strings.Compare(
+			fmt.Sprintf("%s_%d_%s", rows[i][2], rows[i][3], rows[i][1]),
+			fmt.Sprintf("%s_%d_%s", rows[j][2], rows[j][3], rows[j][1]),
+		) < 0
+	})
+
+	require.Equal(t, expected, rows)
+}
+
+func getRefCommits(
+	t *testing.T,
+	repo borges.Repository,
+	r *plumbing.Reference,
+	origin plumbing.Hash,
+	idx int,
+	seen map[plumbing.Hash]struct{},
+) [][]interface{} {
+	t.Helper()
+
+	if _, ok := seen[origin]; ok {
+		return nil
+	}
+	seen[origin] = struct{}{}
+
+	c, err := repo.R().CommitObject(origin)
+	require.NoError(t, err)
+
+	var result = [][]interface{}{{
+		string(repo.ID()),
+		c.Hash.String(),
+		string(r.Name()),
+		idx,
+	}}
+
+	for _, h := range c.ParentHashes {
+		if _, ok := seen[h]; !ok {
+			seen[origin] = struct{}{}
+			result = append(result, getRefCommits(t, repo, r, h, idx+1, seen)...)
+		}
+	}
+
+	return result
 }
 
 func assertRefs(t *testing.T, db *sql.DB, repo borges.Repository) {
@@ -440,6 +534,15 @@ func scanBlob(rows *sql.Rows) ([]interface{}, error) {
 	return []interface{}{id, hash, size, content, isBinary}, nil
 }
 
+func scanRemote(rows *sql.Rows) ([]interface{}, error) {
+	var id, name string
+	var urls, fetch []string
+	if err := rows.Scan(&id, &name, pq.Array(&urls), pq.Array(&fetch)); err != nil {
+		return nil, err
+	}
+	return []interface{}{id, name, urls, fetch}, nil
+}
+
 func setupDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
 
@@ -521,6 +624,7 @@ func setupMigrator(t *testing.T, db *sql.DB) *migrator {
 		treeBlobs:    copiers["tree_blobs"],
 		files:        copiers["tree_files"],
 		blobs:        copiers["blobs"],
+		remotes:      copiers["remotes"],
 		repoWorkers:  runtime.NumCPU(),
 	}
 }
