@@ -18,11 +18,13 @@ import (
 )
 
 type fileTreeListener struct {
-	repo        borges.Repository
-	treeEntries *tableCopier
-	treeBlobs   *tableCopier
-	files       *tableCopier
-	blobs       *tableCopier
+	repo             borges.Repository
+	treeEntries      *tableCopier
+	treeBlobs        *tableCopier
+	files            *tableCopier
+	blobs            *tableCopier
+	maxBlobSize      uint64
+	allowBinaryBlobs bool
 }
 
 func (l *fileTreeListener) onTreeEntrySeen(tree plumbing.Hash, entry object.TreeEntry) error {
@@ -71,12 +73,17 @@ func (l *fileTreeListener) onFileSeen(path string, tree, blob plumbing.Hash) err
 }
 
 func (l *fileTreeListener) onBlobSeen(blob *object.Blob, content []byte) error {
+	isBinary := isBinary(content)
+	if uint64(blob.Size) > l.maxBlobSize*1024 || (!l.allowBinaryBlobs && isBinary) {
+		content = nil
+	}
+
 	values := []interface{}{
 		l.repo.ID(),
 		blob.Hash.String(),
 		blob.Size,
 		content,
-		isBinary(content),
+		isBinary,
 	}
 
 	if err := l.blobs.copy(values...); err != nil {
@@ -198,7 +205,7 @@ func (f fileTreeVisitor) visitEntry(
 
 		tree, _ := f.cache.tree(entry.Hash)
 		node.entries = append(node.entries, tree)
-	} else {
+	} else if entry.Mode.IsFile() {
 		if err := f.visitFile(entry.Hash, path); err != nil {
 			return err
 		}
@@ -221,13 +228,13 @@ func (f fileTreeVisitor) visitFile(hash plumbing.Hash, path string) error {
 		return err
 	}
 
-	if f.cache.blobSeen(hash) {
+	if f.cache.blobSeen(hash) || hash == plumbing.ZeroHash {
 		return nil
 	}
 
 	blob, err := f.repo.blob(hash)
 	if err != nil {
-		return fmt.Errorf("could not get blob: %s", err)
+		return fmt.Errorf("could not get blob %q: %s", hash, err)
 	}
 
 	content, err := f.repo.blobContent(blob)

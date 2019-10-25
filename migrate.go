@@ -16,9 +16,11 @@ import (
 )
 
 type migrator struct {
-	lib         borges.Library
-	db          *sql.DB
-	repoWorkers int
+	lib              borges.Library
+	db               *sql.DB
+	repoWorkers      int
+	allowBinaryBlobs bool
+	maxBlobSize      uint64
 
 	repositories *tableCopier
 	refs         *tableCopier
@@ -55,6 +57,10 @@ type Options struct {
 	// Full migrates all data from all trees in the repository, instead of just
 	// the ones referenced in the HEAD commits of each reference.
 	Full bool
+	// MaxBlobSize in megabytes to import a blob.
+	MaxBlobSize uint64
+	// AllowBinaryBlobs to be exported.
+	AllowBinaryBlobs bool
 }
 
 // Migrate the given git repositories library to the given database.
@@ -74,18 +80,20 @@ func Migrate(
 	}
 
 	m := &migrator{
-		lib:          lib,
-		db:           db,
-		repositories: copiers["repositories"],
-		refs:         copiers["refs"],
-		refCommits:   copiers["ref_commits"],
-		commits:      copiers["commits"],
-		treeEntries:  copiers["tree_entries"],
-		treeBlobs:    copiers["tree_blobs"],
-		files:        copiers["tree_files"],
-		blobs:        copiers["blobs"],
-		remotes:      copiers["remotes"],
-		repoWorkers:  opts.RepoWorkers,
+		lib:              lib,
+		db:               db,
+		repositories:     copiers["repositories"],
+		refs:             copiers["refs"],
+		refCommits:       copiers["ref_commits"],
+		commits:          copiers["commits"],
+		treeEntries:      copiers["tree_entries"],
+		treeBlobs:        copiers["tree_blobs"],
+		files:            copiers["tree_files"],
+		blobs:            copiers["blobs"],
+		remotes:          copiers["remotes"],
+		repoWorkers:      opts.RepoWorkers,
+		allowBinaryBlobs: opts.AllowBinaryBlobs,
+		maxBlobSize:      opts.MaxBlobSize,
 	}
 
 	iter, err := lib.Repositories(borges.ReadOnlyMode)
@@ -312,11 +320,13 @@ func (m *migrator) migrateTrees(
 	trees []plumbing.Hash,
 ) error {
 	listener := &fileTreeListener{
-		repo:        r,
-		treeEntries: m.treeEntries,
-		treeBlobs:   m.treeBlobs,
-		files:       m.files,
-		blobs:       m.blobs,
+		repo:             r,
+		treeEntries:      m.treeEntries,
+		treeBlobs:        m.treeBlobs,
+		files:            m.files,
+		blobs:            m.blobs,
+		maxBlobSize:      m.maxBlobSize,
+		allowBinaryBlobs: m.allowBinaryBlobs,
 	}
 
 	treesCache := newTreesCache()

@@ -51,6 +51,8 @@ To configure how git2pg works, you will need to use environment variables to spe
 - `-create` create the tables necessary in the schema.
 - `-drop` drop the tables if they exist before creating them again. This option cannot be used unless `-create` is used as well.
 - `-full` migrate all the trees in the repository for each commit of each reference. By default, only the trees of the HEAD of each reference is migrated, because the space and time it takes lowers dramatically and is the most common case. If you need the full repository data, use this option.
+- `-max-blob-size=N` migrate only blobs with a size lower than the given number in megabytes.
+- `-no-binary-blobs` do not migrate blobs of files that are binaries.
 
 **Note on setting worker numbers**
 

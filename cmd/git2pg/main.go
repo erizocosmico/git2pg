@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"time"
 
 	"github.com/erizocosmico/git2pg"
 	"github.com/sirupsen/logrus"
@@ -22,7 +23,8 @@ import (
 func main() {
 	var path string
 	var buckets, workers, repoWorkers int
-	var useSiva, rooted, verbose, drop, create, full bool
+	var useSiva, rooted, verbose, drop, create, full, noBinaryBlobs bool
+	var maxBlobSize uint64
 
 	flag.StringVar(&path, "d", "", "path to the repositories library")
 	flag.IntVar(&buckets, "buckets", 0, "number of characters of buckets in the repository library")
@@ -34,6 +36,8 @@ func main() {
 	flag.BoolVar(&rooted, "rooted", false, "use rooted repositories")
 	flag.BoolVar(&useSiva, "siva", false, "use siva repositories")
 	flag.BoolVar(&verbose, "v", false, "verbose mode")
+	flag.Uint64Var(&maxBlobSize, "max-blob-size", 1024, "do not export blobs bigger than this size (in megabytes)")
+	flag.BoolVar(&noBinaryBlobs, "no-binary-blobs", false, "do not export binary blobs")
 
 	flag.Parse()
 
@@ -74,9 +78,11 @@ func main() {
 	}()
 
 	err = git2pg.Migrate(ctx, lib, db, git2pg.Options{
-		Workers:     workers,
-		RepoWorkers: repoWorkers,
-		Full:        full,
+		Workers:          workers,
+		RepoWorkers:      repoWorkers,
+		Full:             full,
+		MaxBlobSize:      maxBlobSize,
+		AllowBinaryBlobs: !noBinaryBlobs,
 	})
 	if err != nil {
 		logrus.Fatalf("unable to migrate library to database: %s", err)
@@ -113,7 +119,15 @@ func initDB(create, drop bool) (*sql.DB, error) {
 		return nil, fmt.Errorf("unable to open connection to database: %s", err)
 	}
 
-	if err := db.Ping(); err != nil {
+	for i := 0; i < 10; i++ {
+		if err = db.Ping(); err == nil {
+			break
+		}
+
+		time.Sleep(time.Duration(i) * 100 * time.Millisecond)
+	}
+
+	if err != nil {
 		return nil, fmt.Errorf("unable to connect to database: %s", err)
 	}
 
