@@ -66,6 +66,32 @@ For example, in a 32 core machine, where you want 2 repo workers per repository,
 git2pg -d /path/to/repos -workers=4 -repo-workers=2
 ```
 
+## Docker image usage
+
+Pull the image from the docker registry:
+
+```
+docker pull erizocosmico/git2pg
+```
+
+And then run the image providing the following data:
+
+- Database configuration via environment variables (described in the environment variables section).
+- Mount your repository folder as a volume to `/repositories`.
+- Provide the command line flags you need.
+
+For example:
+
+```
+docker run --name git2pg -v /path/to/repositories:/repositories \
+    -e DBUSER=dbuser \
+    -e DBPASS=dbpass \
+    -e DBPORT=5432 \
+    -e DBNAME=dbname \
+    -e DBHOST=postgres \
+    erizocosmico/git2pg -workers=4 -repo-workers=2 -create -drop -v
+```
+
 ## Schema
 
 The schema is provided in `schema.sql` for reference purposes, but you can create it directly using the tool with the `-create` command line flag.
