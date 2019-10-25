@@ -7,9 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"runtime"
-	"sort"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -102,21 +100,7 @@ func assertRefCommits(t *testing.T, db *sql.DB, repo borges.Repository) {
 		expected = append(expected, getRefCommits(t, repo, r, r.Hash(), 0, seen)...)
 	}
 
-	sort.Slice(expected, func(i, j int) bool {
-		return strings.Compare(
-			fmt.Sprintf("%s_%d_%s", expected[i][2], expected[i][3], expected[i][1]),
-			fmt.Sprintf("%s_%d_%s", expected[j][2], expected[j][3], expected[j][1]),
-		) < 0
-	})
-
-	sort.Slice(rows, func(i, j int) bool {
-		return strings.Compare(
-			fmt.Sprintf("%s_%d_%s", rows[i][2], rows[i][3], rows[i][1]),
-			fmt.Sprintf("%s_%d_%s", rows[j][2], rows[j][3], rows[j][1]),
-		) < 0
-	})
-
-	require.Equal(t, expected, rows)
+	require.ElementsMatch(t, expected, rows)
 }
 
 func getRefCommits(
@@ -184,10 +168,7 @@ func assertRefs(t *testing.T, db *sql.DB, repo borges.Repository) {
 		return nil
 	}))
 
-	sortByHash(expected, 2)
-	sortByHash(rows, 2)
-
-	require.Equal(t, expected, rows)
+	require.ElementsMatch(t, expected, rows)
 }
 
 func assertBlobs(t *testing.T, db *sql.DB, repo borges.Repository) {
@@ -349,26 +330,7 @@ func assertCommits(t *testing.T, db *sql.DB, repo borges.Repository) {
 		return nil
 	}))
 
-	sort.Slice(expected, func(i, j int) bool {
-		return strings.Compare(
-			expected[i][1].(string),
-			expected[j][1].(string),
-		) < 0
-	})
-
-	sortByHash(rows, 1)
-	sortByHash(expected, 1)
-
-	require.Equal(t, expected, rows)
-}
-
-func sortByHash(rows [][]interface{}, hashIdx int) {
-	sort.Slice(rows, func(i, j int) bool {
-		return strings.Compare(
-			rows[i][hashIdx].(string),
-			rows[j][hashIdx].(string),
-		) < 0
-	})
+	require.ElementsMatch(t, expected, rows)
 }
 
 func assertTreeEntries(t *testing.T, db *sql.DB, repo borges.Repository) {
@@ -395,21 +357,7 @@ func assertTreeEntries(t *testing.T, db *sql.DB, repo borges.Repository) {
 		return nil
 	}))
 
-	sort.Slice(rows, func(i, j int) bool {
-		return strings.Compare(
-			rows[i][3].(string)+rows[i][1].(string),
-			rows[j][3].(string)+rows[j][1].(string),
-		) < 0
-	})
-
-	sort.Slice(expected, func(i, j int) bool {
-		return strings.Compare(
-			expected[i][3].(string)+expected[i][1].(string),
-			expected[j][3].(string)+expected[j][1].(string),
-		) < 0
-	})
-
-	require.Equal(t, expected, rows)
+	require.ElementsMatch(t, expected, rows)
 }
 
 func repoTableRows(
@@ -615,16 +563,18 @@ func setupMigrator(t *testing.T, db *sql.DB) *migrator {
 	}
 
 	return &migrator{
-		db:           db,
-		repositories: copiers["repositories"],
-		refs:         copiers["refs"],
-		refCommits:   copiers["ref_commits"],
-		commits:      copiers["commits"],
-		treeEntries:  copiers["tree_entries"],
-		treeBlobs:    copiers["tree_blobs"],
-		files:        copiers["tree_files"],
-		blobs:        copiers["blobs"],
-		remotes:      copiers["remotes"],
-		repoWorkers:  runtime.NumCPU(),
+		db:               db,
+		repositories:     copiers["repositories"],
+		refs:             copiers["refs"],
+		refCommits:       copiers["ref_commits"],
+		commits:          copiers["commits"],
+		treeEntries:      copiers["tree_entries"],
+		treeBlobs:        copiers["tree_blobs"],
+		files:            copiers["tree_files"],
+		blobs:            copiers["blobs"],
+		remotes:          copiers["remotes"],
+		repoWorkers:      runtime.NumCPU(),
+		allowBinaryBlobs: true,
+		maxBlobSize:      1024,
 	}
 }
