@@ -502,11 +502,11 @@ func setupDB(t *testing.T) (*sql.DB, func()) {
 	db, err := sql.Open("postgres", dburl)
 	require.NoError(t, err)
 
-	require.NoError(t, DropTables(db))
-	require.NoError(t, CreateTables(db))
+	require.NoError(t, DropTables(db, false))
+	require.NoError(t, CreateTables(db, ""))
 
 	return db, func() {
-		require.NoError(t, DropTables(db))
+		require.NoError(t, DropTables(db, false))
 	}
 }
 

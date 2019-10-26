@@ -7,9 +7,14 @@ import (
 
 // DropTables drops all the git2pg tables from the given database if they
 // exist.
-func DropTables(db *sql.DB) error {
+func DropTables(db *sql.DB, foreign bool) error {
+	tableType := "TABLE"
+	if foreign {
+		tableType = "FOREIGN TABLE"
+	}
+
 	for table := range schema {
-		_, err := db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+		_, err := db.Exec(fmt.Sprintf("DROP %s IF EXISTS %s", tableType, table))
 		if err != nil {
 			return fmt.Errorf("could not drop table %s: %s", table, err)
 		}
@@ -19,9 +24,16 @@ func DropTables(db *sql.DB) error {
 
 // CreateTables creates all git2pg tables in the given database if they
 // do not exist already.
-func CreateTables(db *sql.DB) error {
+func CreateTables(db *sql.DB, cstoreServer string) error {
+	var prefix = "CREATE TABLE IF NOT EXISTS %s  "
+	var suffix = ""
+	if cstoreServer != "" {
+		prefix = "CREATE FOREIGN TABLE IF NOT EXISTS %s "
+		suffix = fmt.Sprintf("SERVER %s OPTIONS(compression 'pglz')", cstoreServer)
+	}
+
 	for table, query := range schema {
-		_, err := db.Exec(query)
+		_, err := db.Exec(fmt.Sprintf(prefix+query+suffix, table))
 		if err != nil {
 			return fmt.Errorf("could not create table %s: %s", table, err)
 		}
@@ -30,24 +42,24 @@ func CreateTables(db *sql.DB) error {
 }
 
 var schema = map[string]string{
-	"repositories": `CREATE TABLE IF NOT EXISTS repositories (
+	"repositories": `(
 		repository_id TEXT NOT NULL
 	)`,
 
-	"refs": `CREATE TABLE IF NOT EXISTS refs (
+	"refs": `(
 		repository_id TEXT NOT NULL,
 		ref_name TEXT NOT NULL,
 		commit_hash VARCHAR(40) NOT NULL
 	)`,
 
-	"ref_commits": `CREATE TABLE IF NOT EXISTS ref_commits (
+	"ref_commits": `(
 		repository_id TEXT NOT NULL,
 		commit_hash VARCHAR(40) NOT NULL,
 		ref_name TEXT NOT NULL,
 		history_index BIGINT NOT NULL
 	)`,
 
-	"commits": `CREATE TABLE IF NOT EXISTS commits (
+	"commits": `(
 		repository_id TEXT NOT NULL,
 		commit_hash VARCHAR(40) NOT NULL,
 		commit_author_name TEXT NOT NULL,
@@ -61,7 +73,7 @@ var schema = map[string]string{
 		commit_parents VARCHAR(40)[] NOT NULL
 	)`,
 
-	"tree_entries": `CREATE TABLE IF NOT EXISTS tree_entries (
+	"tree_entries": `(
 		repository_id TEXT NOT NULL,
 		tree_entry_name TEXT NOT NULL,
 		blob_hash VARCHAR(40) NOT NULL,
@@ -69,7 +81,7 @@ var schema = map[string]string{
 		tree_entry_mode VARCHAR(40) NOT NULL
 	)`,
 
-	"tree_files": `CREATE TABLE IF NOT EXISTS tree_files (
+	"tree_files": `(
 		repository_id TEXT NOT NULL,
 		root_tree_hash VARCHAR(40) NOT NULL,
 		file_path TEXT NOT NULL,
@@ -77,13 +89,13 @@ var schema = map[string]string{
 		is_vendor BOOLEAN NOT NULL DEFAULT false
 	)`,
 
-	"tree_blobs": `CREATE TABLE IF NOT EXISTS tree_blobs (
+	"tree_blobs": `(
 		repository_id TEXT NOT NULL,
 		root_tree_hash VARCHAR(40) NOT NULL,
 		blob_hash VARCHAR(40) NOT NULL
 	)`,
 
-	"blobs": `CREATE TABLE IF NOT EXISTS blobs (
+	"blobs": `(
 		repository_id TEXT NOT NULL,
 		blob_hash VARCHAR(40) NOT NULL,
 		blob_size BIGINT NOT NULL,
@@ -91,7 +103,7 @@ var schema = map[string]string{
 		is_binary BOOLEAN NOT NULL DEFAULT false
 	)`,
 
-	"remotes": `CREATE TABLE IF NOT EXISTS remotes (
+	"remotes": `(
 		repository_id TEXT NOT NULL,
 		remote_name TEXT NOT NULL,
 		urls TEXT[] NOT NULL,

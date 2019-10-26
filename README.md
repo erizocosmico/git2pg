@@ -53,6 +53,7 @@ To configure how git2pg works, you will need to use environment variables to spe
 - `-full` migrate all the trees in the repository for each commit of each reference. By default, only the trees of the HEAD of each reference is migrated, because the space and time it takes lowers dramatically and is the most common case. If you need the full repository data, use this option.
 - `-max-blob-size=N` migrate only blobs with a size lower than the given number in megabytes.
 - `-no-binary-blobs` do not migrate blobs of files that are binaries.
+- `-cstore=CSTORE_FDW_SERVER_NAME` if the data should be imported in columnar format to [cstore_fdw](https://github.com/citusdata/cstore_fdw), provide the server name. e.g. `-cstore=cstore_server`.
 
 **Note on setting worker numbers**
 

@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	var path string
+	var path, cstoreServer string
 	var buckets, workers, repoWorkers int
 	var useSiva, rooted, verbose, drop, create, full, noBinaryBlobs bool
 	var maxBlobSize uint64
@@ -38,6 +38,7 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "verbose mode")
 	flag.Uint64Var(&maxBlobSize, "max-blob-size", 1024, "do not export blobs bigger than this size (in megabytes)")
 	flag.BoolVar(&noBinaryBlobs, "no-binary-blobs", false, "do not export binary blobs")
+	flag.StringVar(&cstoreServer, "cstore", "", "name of the cstore_fdw server, if the data should be stored in columnar format")
 
 	flag.Parse()
 
@@ -54,7 +55,7 @@ func main() {
 		logrus.Fatal(err)
 	}
 
-	db, err := initDB(create, drop)
+	db, err := initDB(create, drop, cstoreServer)
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -113,7 +114,7 @@ func envOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-func initDB(create, drop bool) (*sql.DB, error) {
+func initDB(create, drop bool, cstoreServer string) (*sql.DB, error) {
 	db, err := sql.Open("postgres", connectionString())
 	if err != nil {
 		return nil, fmt.Errorf("unable to open connection to database: %s", err)
@@ -133,14 +134,14 @@ func initDB(create, drop bool) (*sql.DB, error) {
 
 	if drop {
 		logrus.Info("dropping tables")
-		if err := git2pg.DropTables(db); err != nil {
+		if err := git2pg.DropTables(db, cstoreServer != ""); err != nil {
 			return nil, fmt.Errorf("could not drop tables: %s", err)
 		}
 	}
 
 	if create {
 		logrus.Info("creating tables")
-		if err := git2pg.CreateTables(db); err != nil {
+		if err := git2pg.CreateTables(db, cstoreServer); err != nil {
 			return nil, fmt.Errorf("could not create tables: %s", err)
 		}
 	}
